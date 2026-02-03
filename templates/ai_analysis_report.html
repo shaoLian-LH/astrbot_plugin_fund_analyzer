@@ -91,14 +91,97 @@
         }
 
         .ai-content {
-            white-space: pre-wrap;
             background-color: #f6ffed;
             border: 1px solid #b7eb8f;
             border-radius: 6px;
             padding: 12px;
             margin: 0 15px;
             font-size: 14px;
-            line-height: 1.6;
+            line-height: 1.7;
+        }
+
+        /* Markdown 渲染样式 */
+        .ai-content h1,
+        .ai-content h2,
+        .ai-content h3,
+        .ai-content h4 {
+            color: #1890ff;
+            margin: 12px 0 8px 0;
+            font-weight: 600;
+        }
+
+        .ai-content h1 {
+            font-size: 18px;
+        }
+
+        .ai-content h2 {
+            font-size: 16px;
+        }
+
+        .ai-content h3 {
+            font-size: 15px;
+        }
+
+        .ai-content h4 {
+            font-size: 14px;
+        }
+
+        .ai-content p {
+            margin: 8px 0;
+            text-align: justify;
+        }
+
+        .ai-content ul,
+        .ai-content ol {
+            padding-left: 20px;
+            margin: 8px 0;
+        }
+
+        .ai-content li {
+            margin-bottom: 4px;
+        }
+
+        .ai-content strong {
+            color: #333;
+            font-weight: 600;
+        }
+
+        .ai-content em {
+            color: #666;
+            font-style: italic;
+        }
+
+        .ai-content code {
+            background-color: #f0f0f0;
+            padding: 2px 6px;
+            border-radius: 3px;
+            font-family: monospace;
+            font-size: 13px;
+        }
+
+        .ai-content blockquote {
+            border-left: 3px solid #1890ff;
+            margin: 10px 0;
+            padding-left: 12px;
+            color: #666;
+        }
+
+        .ai-content table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 10px 0;
+        }
+
+        .ai-content th,
+        .ai-content td {
+            border: 1px solid #e8e8e8;
+            padding: 6px 10px;
+            text-align: left;
+        }
+
+        .ai-content th {
+            background-color: #fafafa;
+            font-weight: 600;
         }
 
         .tag {
@@ -144,31 +227,6 @@
             border-top: 1px solid #eee;
             margin-top: 15px;
         }
-
-        /* Markdown 样式模拟 */
-        .markdown-body h3 {
-            font-size: 15px;
-            margin: 10px 0 5px;
-            color: #333;
-        }
-
-        .markdown-body p {
-            margin: 5px 0;
-        }
-
-        .markdown-body ul {
-            padding-left: 20px;
-            margin: 5px 0;
-        }
-
-        .markdown-body li {
-            margin-bottom: 3px;
-        }
-
-        .markdown-body strong {
-            color: #333;
-            font-weight: 600;
-        }
     </style>
 </head>
 
@@ -205,7 +263,7 @@
         </div>
 
         <div class="section-title">AI 深度解读</div>
-        <div class="ai-content markdown-body">
+        <div class="ai-content">
             {{ analysis_content | safe }}
         </div>
 

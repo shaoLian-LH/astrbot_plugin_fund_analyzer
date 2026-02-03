@@ -1343,19 +1343,21 @@ class FundAnalyzerPlugin(Star):
                 # 获取技术信号
                 signal, score = self.ai_analyzer.get_technical_signal(history or [])
 
-                # 简单处理 Markdown 加粗，使其在 HTML 中生效
-                # 注意：这只是一个简单的替换，复杂的 Markdown 建议引入 markdown 库
-                formatted_content = analysis_result.replace(
-                    "**", ""
-                )  # 暂时去除加粗符，因为预设样式可能不兼容，或者改为 HTML 标签
-                # 如果想支持加粗： formatted_content = analysis_result.replace("**", "<b>", 1).replace("**", "</b>", 1) ... 需要正则
-                # 这里简单起见，利用 white-space: pre-wrap，直接显示原文即可，或者做简单清洗
-                # 实际上，保留 ** 也行，用户能看懂。为了美观，我们可以尝试简单的正则替换
-                import re
-
-                formatted_content = re.sub(
-                    r"\*\*(.*?)\*\*", r"<strong>\1</strong>", analysis_result
-                )
+                # 使用 markdown 库将 Markdown 转换为 HTML
+                try:
+                    import markdown
+                    formatted_content = markdown.markdown(
+                        analysis_result,
+                        extensions=['nl2br', 'tables', 'fenced_code']
+                    )
+                except ImportError:
+                    # 如果 markdown 库不可用，回退到简单的正则替换
+                    import re
+                    formatted_content = re.sub(
+                        r"\*\*(.*?)\*\*", r"<strong>\1</strong>", analysis_result
+                    )
+                    # 处理换行
+                    formatted_content = formatted_content.replace("\n", "<br>")
 
                 # 准备模板数据
                 data = {
