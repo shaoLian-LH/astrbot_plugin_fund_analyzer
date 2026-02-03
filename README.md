@@ -24,7 +24,12 @@
 
 ### 📸 智能分析效果展示
 
+<details>
+<summary>👆 点击展开查看示例图片</summary>
+
 ![智能分析示例](templates/example.png)
+
+</details>
 
 > 💡 **使用方法**：发送 `智能分析 161226` 即可获取 AI 分析报告
 > 
