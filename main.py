@@ -672,7 +672,7 @@ class FundAnalyzerPlugin(Star):
             yield event.plain_result(f"❌ 获取行情失败: {str(e)}")
 
     @filter.command("股票")
-    async def stock_query(self, event: AstrMessageEvent, code: str = None):
+    async def stock_query(self, event: AstrMessageEvent, code: str = ""):
         """
         查询A股实时行情
         用法: 股票 <股票代码>
@@ -689,7 +689,7 @@ class FundAnalyzerPlugin(Star):
                 )
                 return
 
-            stock_code = str(code).strip()
+            stock_code = str(code).strip().zfill(6)
             yield event.plain_result(f"🔍 正在查询股票 {stock_code} 的实时行情...")
 
             info = await self.stock_analyzer.get_stock_realtime(stock_code)
@@ -714,7 +714,7 @@ class FundAnalyzerPlugin(Star):
             yield event.plain_result(f"❌ 查询失败: {str(e)}")
 
     @filter.command("搜索股票")
-    async def search_stock(self, event: AstrMessageEvent, keyword: str = None):
+    async def search_stock(self, event: AstrMessageEvent, keyword: str = ""):
         """
         搜索A股股票
         用法: 搜索股票 <关键词>
@@ -767,7 +767,7 @@ class FundAnalyzerPlugin(Star):
             yield event.plain_result(f"❌ 搜索失败: {str(e)}")
 
     @filter.command("基金")
-    async def fund_query(self, event: AstrMessageEvent, code: str = None):
+    async def fund_query(self, event: AstrMessageEvent, code: str = ""):
         """
         查询基金实时行情
         用法: 基金 [基金代码]
@@ -822,7 +822,7 @@ class FundAnalyzerPlugin(Star):
             yield event.plain_result(f"❌ 查询失败: {str(e)}")
 
     @filter.command("基金分析")
-    async def fund_analysis(self, event: AstrMessageEvent, code: str = None):
+    async def fund_analysis(self, event: AstrMessageEvent, code: str = ""):
         """
         基金技术分析
         用法: 基金分析 [基金代码]
@@ -1047,7 +1047,7 @@ class FundAnalyzerPlugin(Star):
 
     @filter.command("基金历史")
     async def fund_history(
-        self, event: AstrMessageEvent, code: str = None, days: str = "10"
+        self, event: AstrMessageEvent, code: str = "", days: str = "10"
     ):
         """
         查询基金历史行情
@@ -1263,7 +1263,7 @@ class FundAnalyzerPlugin(Star):
             yield event.plain_result(f"❌ 设置失败: {str(e)}")
 
     @filter.command("智能分析")
-    async def ai_fund_analysis(self, event: AstrMessageEvent, code: str = None):
+    async def ai_fund_analysis(self, event: AstrMessageEvent, code: str = ""):
         """
         使用大模型进行智能基金分析（含量化数据）
         用法: 智能分析 [基金代码]
@@ -1439,7 +1439,7 @@ class FundAnalyzerPlugin(Star):
             yield event.plain_result(f"❌ 分析失败: {str(e)}")
 
     @filter.command("量化分析")
-    async def quant_analysis(self, event: AstrMessageEvent, code: str = None):
+    async def quant_analysis(self, event: AstrMessageEvent, code: str = ""):
         """
         纯量化分析（无需大模型）
         包含绩效指标、技术指标、策略回测
@@ -1667,7 +1667,7 @@ class FundAnalyzerPlugin(Star):
 
     @filter.command("基金对比")
     async def fund_compare(
-        self, event: AstrMessageEvent, code1: str = None, code2: str = None
+        self, event: AstrMessageEvent, code1: str = "", code2: str = ""
     ):
         """
         对比两只基金的表现
