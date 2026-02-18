@@ -24,6 +24,27 @@ from .image_generator import render_fund_image, PLAYWRIGHT_AVAILABLE
 
 # 导入东方财富 API 模块（直接 HTTP 请求，不依赖 akshare）
 from .eastmoney_api import get_api as get_eastmoney_api
+from .data_handler import DataHandler
+from .services.position_service import PositionService
+from .services.nav_sync_service import NavSyncService
+from .services.market_service import MarketService
+from .services.analysis_service import AnalysisService
+from .formatters.position_formatter import (
+    format_nav_sync_result,
+    format_position_add_result,
+    format_position_overview,
+)
+from .formatters.fund_formatter import (
+    ssgz_usage_text,
+    ssgz_invalid_code_text,
+    ssgz_not_found_text,
+    format_ssgz_fallback_text,
+    format_fund_info,
+    format_realtime_valuation,
+    format_analysis,
+    format_stock_info,
+    format_precious_metal_prices,
+)
 
 # 默认超时时间（秒）- AKShare获取LOF数据需要较长时间
 DEFAULT_TIMEOUT = 120  # 2分钟
@@ -277,6 +298,11 @@ class FundAnalyzer:
 
 # 贵金属价格缓存TTL（15分钟）
 METAL_CACHE_TTL = 900
+# 持仓基金净值定时同步间隔（秒）
+NAV_SYNC_INTERVAL_SECONDS = 1800
+NAV_SYNC_DEFAULT_FETCH_DAYS = 120
+NAV_SYNC_MAX_FETCH_DAYS = 365
+NAV_SYNC_FETCH_BUFFER_DAYS = 5
 
 
 @register(
@@ -294,8 +320,25 @@ class FundAnalyzerPlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
         self.analyzer = FundAnalyzer()
+        self.data_handler = DataHandler()
         # 初始化股票分析器
         self.stock_analyzer = StockAnalyzer()
+        # 领域服务
+        self.position_service = PositionService(
+            normalize_fund_code=self._normalize_ssgz_fund_code,
+            logger=logger,
+        )
+        self.market_service = MarketService(logger=logger, metal_cache_ttl=METAL_CACHE_TTL)
+        self.analysis_service = AnalysisService(logger=logger)
+        self.nav_sync_service = NavSyncService(
+            data_handler=self.data_handler,
+            analyzer=self.analyzer,
+            logger=logger,
+            interval_seconds=NAV_SYNC_INTERVAL_SECONDS,
+            default_fetch_days=NAV_SYNC_DEFAULT_FETCH_DAYS,
+            max_fetch_days=NAV_SYNC_MAX_FETCH_DAYS,
+            fetch_buffer_days=NAV_SYNC_FETCH_BUFFER_DAYS,
+        )
         # 初始化图片渲染器
         self.image_renderer = HtmlRenderer()
         # 是否使用本地图片生成器（优先使用）
@@ -307,11 +350,9 @@ class FundAnalyzerPlugin(Star):
         self._data_dir.mkdir(parents=True, exist_ok=True)
         # 加载用户设置
         self.user_fund_settings: dict[str, str] = self._load_user_settings()
-        # 贵金属价格缓存
-        self._metal_cache: dict = {}
-        self._metal_cache_time: datetime | None = None
         # 检查依赖
         self._check_dependencies()
+        self._ensure_nav_sync_task()
         logger.info("基金分析插件已加载")
 
     def _check_dependencies(self):
@@ -384,38 +425,79 @@ class FundAnalyzerPlugin(Star):
             return None
         return normalized_code
 
+    def _extract_command_payload(
+        self, event: AstrMessageEvent, command_name: str
+    ) -> str:
+        return self.position_service.extract_command_payload(event, command_name)
+
+    def _resolve_position_owner(self, event: AstrMessageEvent) -> tuple[str, str]:
+        return self.position_service.resolve_position_owner(event)
+
+    @staticmethod
+    def _fund_position_usage_text() -> str:
+        return PositionService.fund_position_usage_text()
+
+    def _parse_position_records(
+        self, payload: str
+    ) -> tuple[list[dict[str, Any]], str | None]:
+        return self.position_service.parse_position_records(payload)
+
+    async def _batch_fetch_fund_infos(
+        self, fund_codes: list[str], max_concurrency: int = 6
+    ) -> dict[str, FundInfo]:
+        return await self.position_service.batch_fetch_fund_infos(
+            analyzer=self.analyzer,
+            fund_codes=fund_codes,
+            max_concurrency=max_concurrency,
+        )
+
+    @staticmethod
+    def _format_position_add_result(
+        saved_records: list[dict[str, Any]],
+        fund_infos: dict[str, FundInfo],
+    ) -> str:
+        return format_position_add_result(saved_records, fund_infos)
+
+    @staticmethod
+    def _format_position_overview(
+        positions: list[dict[str, Any]],
+        fund_infos: dict[str, FundInfo],
+    ) -> str:
+        return format_position_overview(positions, fund_infos)
+
+    def _ensure_nav_sync_task(self) -> None:
+        self.nav_sync_service.ensure_task()
+
+    async def _sync_position_funds_nav(
+        self,
+        fund_codes: list[str] | None = None,
+        force_full: bool = False,
+        trigger: str = "manual",
+    ) -> dict[str, Any]:
+        return await self.nav_sync_service.sync_position_funds_nav(
+            fund_codes=fund_codes,
+            force_full=force_full,
+            trigger=trigger,
+        )
+
+    @staticmethod
+    def _format_nav_sync_result(stats: dict[str, Any], title: str) -> str:
+        return format_nav_sync_result(stats, title)
+
     @staticmethod
     def _ssgz_usage_text() -> str:
-        """ssgz 命令用法文本"""
-        return (
-            "❌ 请输入基金代码\n"
-            "💡 用法: ssgz <基金代码>\n"
-            "💡 示例: ssgz 001632"
-        )
+        return ssgz_usage_text()
 
     @staticmethod
     def _ssgz_invalid_code_text(raw_code: str) -> str:
-        """ssgz 命令代码格式错误提示"""
-        return (
-            f"❌ 基金代码格式错误: {raw_code}\n"
-            "💡 请使用 6 位数字代码，例如: ssgz 001632"
-        )
+        return ssgz_invalid_code_text(raw_code)
 
     @staticmethod
     def _ssgz_not_found_text(fund_code: str) -> str:
-        """ssgz 命令未查询到数据提示"""
-        return (
-            f"❌ 未获取到基金 {fund_code} 的实时估值\n"
-            "💡 该接口主要支持场外基金估值数据\n"
-            "💡 建议使用「搜索基金 关键词」先确认基金代码"
-        )
+        return ssgz_not_found_text(fund_code)
 
     def _format_ssgz_fallback_text(self, fund_code: str, realtime: FundInfo) -> str:
-        """ssgz 场内基金兜底提示"""
-        return (
-            f"⚠️ 基金 {fund_code} 暂无场外估值数据，返回场内实时行情：\n\n"
-            f"{self._format_fund_info(realtime)}"
-        )
+        return format_ssgz_fallback_text(fund_code, realtime)
 
     async def _query_ssgz_text(self, fund_code: str) -> str:
         """查询 ssgz 文本结果（估值优先，场内行情兜底）"""
@@ -430,362 +512,22 @@ class FundAnalyzerPlugin(Star):
         return self._ssgz_not_found_text(fund_code)
 
     def _format_fund_info(self, info: FundInfo) -> str:
-        """格式化基金信息为文本"""
-        # 价格为0通常表示暂无数据（原始数据为NaN）
-        if info.latest_price == 0:
-            return f"""
-📊 【{info.name}】
-━━━━━━━━━━━━━━━━━
-⚠️ 暂无实时行情数据
-━━━━━━━━━━━━━━━━━
-🔢 基金代码: {info.code}
-💡 可能原因: 停牌/休市/数据源未更新
-⏰ 查询时间: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
-""".strip()
-
-        change_color = (
-            "🔴" if info.change_rate < 0 else "🟢" if info.change_rate > 0 else "⚪"
-        )
-
-        return f"""
-📊 【{info.name}】实时行情 {info.trend_emoji}
-━━━━━━━━━━━━━━━━━
-💰 最新价: {info.latest_price:.4f}
-{change_color} 涨跌额: {info.change_amount:+.4f}
-{change_color} 涨跌幅: {info.change_rate:+.2f}%
-━━━━━━━━━━━━━━━━━
-📈 今开: {info.open_price:.4f}
-📊 最高: {info.high_price:.4f}
-📉 最低: {info.low_price:.4f}
-📋 昨收: {info.prev_close:.4f}
-━━━━━━━━━━━━━━━━━
-📦 成交量: {info.volume:,.0f}
-💵 成交额: {info.amount:,.2f}
-🔄 换手率: {info.turnover_rate:.2f}%
-━━━━━━━━━━━━━━━━━
-🔢 基金代码: {info.code}
-⏰ 更新时间: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
-""".strip()
+        return format_fund_info(info)
 
     def _format_realtime_valuation(self, valuation: dict) -> str:
-        """格式化场外基金实时估值信息"""
-
-        def safe_float(value, default: float = 0.0) -> float:
-            if value is None:
-                return default
-            try:
-                return float(value)
-            except (ValueError, TypeError):
-                return default
-
-        code = str(valuation.get("code", "")).strip()
-        name = str(valuation.get("name", "")).strip() or "未知基金"
-        estimate_value = safe_float(
-            valuation.get("estimate_value", valuation.get("latest_price"))
-        )
-        unit_value = safe_float(valuation.get("unit_value", valuation.get("prev_close")))
-        change_rate = safe_float(valuation.get("change_rate"))
-        change_amount = safe_float(
-            valuation.get("change_amount", estimate_value - unit_value)
-        )
-        update_time = str(valuation.get("update_time", "")).strip() or "--"
-        valuation_date = str(valuation.get("valuation_date", "")).strip() or "--"
-
-        change_color = "🔴" if change_rate < 0 else "🟢" if change_rate > 0 else "⚪"
-        trend = "📈" if change_rate > 0 else "📉" if change_rate < 0 else "➡️"
-
-        return f"""
-📍 【{name}】实时估值 {trend}
-━━━━━━━━━━━━━━━━━
-💰 估算净值: {estimate_value:.4f}
-📋 单位净值: {unit_value:.4f}
-{change_color} 估算涨跌额: {change_amount:+.4f}
-{change_color} 估算涨跌幅: {change_rate:+.2f}%
-━━━━━━━━━━━━━━━━━
-🔢 基金代码: {code}
-🕐 估值时间: {update_time}
-📅 净值日期: {valuation_date}
-⏰ 查询时间: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
-💡 数据来源: 天天基金估值接口（盘中为估算值）
-""".strip()
+        return format_realtime_valuation(valuation)
 
     def _format_analysis(self, info: FundInfo, indicators: dict) -> str:
-        """格式化技术分析结果"""
-        if not indicators:
-            return "📊 暂无足够数据进行技术分析"
-
-        trend_emoji = {
-            "强势上涨": "🚀",
-            "上涨趋势": "📈",
-            "强势下跌": "💥",
-            "下跌趋势": "📉",
-            "震荡": "↔️",
-        }.get(indicators.get("trend", "震荡"), "❓")
-
-        ma_status = []
-        current = indicators.get("current_price", 0)
-        if indicators.get("ma5"):
-            status = "上" if current > indicators["ma5"] else "下"
-            ma_status.append(f"MA5({indicators['ma5']:.4f}){status}")
-        if indicators.get("ma10"):
-            status = "上" if current > indicators["ma10"] else "下"
-            ma_status.append(f"MA10({indicators['ma10']:.4f}){status}")
-        if indicators.get("ma20"):
-            status = "上" if current > indicators["ma20"] else "下"
-            ma_status.append(f"MA20({indicators['ma20']:.4f}){status}")
-
-        return f"""
-📈 【{info.name}】技术分析
-━━━━━━━━━━━━━━━━━
-{trend_emoji} 趋势判断: {indicators.get("trend", "未知")}
-━━━━━━━━━━━━━━━━━
-📊 均线分析:
-  • {" | ".join(ma_status) if ma_status else "数据不足"}
-━━━━━━━━━━━━━━━━━
-📈 区间收益率:
-  • 5日收益: {indicators.get("return_5d", "--"):+.2f}%
-  • 10日收益: {indicators.get("return_10d", "--"):+.2f}%
-  • 20日收益: {indicators.get("return_20d", "--"):+.2f}%
-━━━━━━━━━━━━━━━━━
-📉 波动分析:
-  • 20日波动率: {indicators.get("volatility", "--"):.4f}
-  • 20日最高: {indicators.get("high_20d", "--"):.4f}
-  • 20日最低: {indicators.get("low_20d", "--"):.4f}
-━━━━━━━━━━━━━━━━━
-💡 投资建议: 请结合自身风险承受能力谨慎投资
-""".strip()
+        return format_analysis(info, indicators)
 
     def _format_stock_info(self, info: StockInfo) -> str:
-        """格式化A股股票信息为文本"""
-        # 价格为0通常表示暂无数据
-        if info.latest_price == 0:
-            return f"""
-📊 【{info.name}】
-━━━━━━━━━━━━━━━━━
-⚠️ 暂无实时行情数据
-━━━━━━━━━━━━━━━━━
-🔢 股票代码: {info.code}
-💡 可能原因: 停牌/休市/数据源未更新
-⏰ 查询时间: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
-""".strip()
-
-        change_color = (
-            "🔴" if info.change_rate < 0 else "🟢" if info.change_rate > 0 else "⚪"
-        )
-
-        # 格式化市值（转换为亿元）
-        def format_market_cap(value):
-            if value >= 100000000:  # 亿元
-                return f"{value / 100000000:.2f}亿"
-            elif value >= 10000:  # 万元
-                return f"{value / 10000:.2f}万"
-            return f"{value:.2f}"
-
-        return f"""
-📊 【{info.name}】实时行情 {info.trend_emoji}
-━━━━━━━━━━━━━━━━━
-💰 最新价: {info.latest_price:.2f}
-{change_color} 涨跌额: {info.change_amount:+.2f}
-{change_color} 涨跌幅: {info.change_rate:+.2f}%
-📏 振幅: {info.amplitude:.2f}%
-━━━━━━━━━━━━━━━━━
-📈 今开: {info.open_price:.2f}
-📊 最高: {info.high_price:.2f}
-📉 最低: {info.low_price:.2f}
-📋 昨收: {info.prev_close:.2f}
-━━━━━━━━━━━━━━━━━
-📦 成交量: {info.volume:,.0f}手
-💵 成交额: {format_market_cap(info.amount)}
-🔄 换手率: {info.turnover_rate:.2f}%
-━━━━━━━━━━━━━━━━━
-📈 市盈率(动态): {info.pe_ratio:.2f}
-📊 市净率: {info.pb_ratio:.2f}
-💰 总市值: {format_market_cap(info.total_market_cap)}
-💎 流通市值: {format_market_cap(info.circulating_market_cap)}
-━━━━━━━━━━━━━━━━━
-🔢 股票代码: {info.code}
-⏰ 更新时间: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
-💡 数据缓存10分钟，仅供参考
-""".strip()
+        return format_stock_info(info)
 
     async def _fetch_precious_metal_prices(self) -> dict:
-        """
-        从NowAPI获取上海黄金交易所贵金属价格
-        返回包含金价和银价的字典
-        API文档: https://www.nowapi.com/api/finance.shgold
-        黄金使用1301，白银使用1302，需分开调用
-        缓存15分钟
-        """
-        import aiohttp
-
-        # 检查缓存是否有效（15分钟）
-        now = datetime.now()
-        if (
-            self._metal_cache
-            and self._metal_cache_time is not None
-            and (now - self._metal_cache_time).total_seconds() < METAL_CACHE_TTL
-        ):
-            logger.debug("使用贵金属价格缓存")
-            return self._metal_cache
-
-        # NowAPI 接口配置
-        api_url = "http://api.k780.com/"
-        base_params = {
-            "app": "finance.gold_price",
-            "appkey": "78365",
-            "sign": "776f93b557ce6e6afeb860b103a587c7",
-            "format": "json",
-        }
-
-        prices = {}
-
-        async def fetch_metal(gold_id: str, key: str, name: str) -> dict | None:
-            """获取单个金属品种的价格"""
-            params = {**base_params, "goldid": gold_id}
-            try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(
-                        api_url, params=params, timeout=aiohttp.ClientTimeout(total=30)
-                    ) as response:
-                        if response.status != 200:
-                            logger.error(f"获取{name}价格失败: HTTP {response.status}")
-                            return None
-
-                        data = await response.json()
-
-                        if data.get("success") != "1":
-                            error_msg = data.get("msg", "未知错误")
-                            logger.error(f"NowAPI返回错误({name}): {error_msg}")
-                            return None
-
-                        result = data.get("result", {})
-                        dt_list = result.get("dtList", {})
-
-                        if gold_id in dt_list:
-                            metal_data = dt_list[gold_id]
-                            return {
-                                "name": metal_data.get("varietynm", name),
-                                "variety": metal_data.get("variety", ""),
-                                "price": float(metal_data.get("last_price", 0) or 0),
-                                "buy_price": float(metal_data.get("buy_price", 0) or 0),
-                                "sell_price": float(
-                                    metal_data.get("sell_price", 0) or 0
-                                ),
-                                "high": float(metal_data.get("high_price", 0) or 0),
-                                "low": float(metal_data.get("low_price", 0) or 0),
-                                "open": float(metal_data.get("open_price", 0) or 0),
-                                "prev_close": float(
-                                    metal_data.get("yesy_price", 0) or 0
-                                ),
-                                "change": float(metal_data.get("change_price", 0) or 0),
-                                "change_rate": metal_data.get("change_margin", "0%"),
-                                "update_time": metal_data.get("uptime", ""),
-                            }
-                        return None
-            except Exception as e:
-                logger.error(f"获取{name}价格出错: {e}")
-                return None
-
-        try:
-            # 分开调用黄金(1301)和白银(1302)
-            gold_data = await fetch_metal("1051", "au_td", "黄金")
-            if gold_data:
-                prices["au_td"] = gold_data
-
-            silver_data = await fetch_metal("1052", "ag_td", "白银")
-            if silver_data:
-                prices["ag_td"] = silver_data
-
-            # 更新缓存
-            if prices:
-                self._metal_cache = prices
-                self._metal_cache_time = now
-                logger.info("贵金属价格已更新并缓存15分钟")
-
-            return prices
-
-        except Exception as e:
-            logger.error(f"获取贵金属价格出错: {e}")
-            # 如果有旧缓存，返回旧数据
-            if self._metal_cache:
-                logger.info("使用过期的贵金属缓存数据")
-                return self._metal_cache
-            return {}
+        return await self.market_service.fetch_precious_metal_prices()
 
     def _format_precious_metal_prices(self, prices: dict) -> str:
-        """格式化贵金属价格信息"""
-        if not prices:
-            return "❌ 获取贵金属价格失败，请稍后重试"
-
-        def parse_change_rate(rate_str: str) -> float:
-            """解析涨跌幅字符串，如 '1.5%' -> 1.5"""
-            try:
-                return float(rate_str.replace("%", "").replace("+", ""))
-            except (ValueError, AttributeError):
-                return 0.0
-
-        def format_item(
-            data: dict, unit: str = "美元/盎司", divisor: float = 1.0
-        ) -> str:
-            """格式化单个金属品种的价格信息
-
-            Args:
-                data: 价格数据字典
-                unit: 显示单位
-                divisor: 除数，用于单位转换（如白银可能需要除以100）
-            """
-            if not data:
-                return "  暂无数据"
-
-            change_rate = parse_change_rate(data.get("change_rate", "0%"))
-            change_emoji = (
-                "🔴" if change_rate < 0 else "🟢" if change_rate > 0 else "⚪"
-            )
-            trend_emoji = "📈" if change_rate > 0 else "📉" if change_rate < 0 else "➡️"
-
-            # 应用单位转换
-            price = data["price"] / divisor
-            change = data.get("change", 0) / divisor
-            open_p = data.get("open", 0) / divisor
-            high_p = data.get("high", 0) / divisor
-            low_p = data.get("low", 0) / divisor
-            buy_p = data.get("buy_price", 0) / divisor
-            sell_p = data.get("sell_price", 0) / divisor
-
-            return f"""  {trend_emoji} 最新价: {price:.2f} {unit}
-  {change_emoji} 涨跌: {change:+.2f} ({data.get("change_rate", "0%")})
-  📊 今开: {open_p:.2f} | 最高: {high_p:.2f} | 最低: {low_p:.2f}
-  💹 买入: {buy_p:.2f} | 卖出: {sell_p:.2f}"""
-
-        lines = [
-            "💰 今日贵金属行情（国际现货）",
-            "━━━━━━━━━━━━━━━━━",
-        ]
-
-        # 黄金 - 国际金价，单位是美元/盎司
-        if "au_td" in prices:
-            lines.append("🥇 黄金")
-            lines.append(format_item(prices["au_td"], "美元/盎司", 1.0))
-            if prices["au_td"].get("update_time"):
-                lines.append(f"  🕐 更新: {prices['au_td']['update_time']}")
-            lines.append("")
-
-        # 白银 - 国际银价，API返回的是美分/盎司，需要除以100转为美元/盎司
-        if "ag_td" in prices:
-            lines.append("🥈 白银")
-            # 白银价格如果大于1000，说明是美分/盎司，需要除以100
-            silver_price = prices["ag_td"].get("price", 0)
-            divisor = 100.0 if silver_price > 1000 else 1.0
-            lines.append(format_item(prices["ag_td"], "美元/盎司", divisor))
-            if prices["ag_td"].get("update_time"):
-                lines.append(f"  🕐 更新: {prices['ag_td']['update_time']}")
-            lines.append("")
-
-        lines.append("━━━━━━━━━━━━━━━━━")
-        lines.append("📌 国际现货24小时交易")
-        lines.append("💡 数据来源: NowAPI | 缓存15分钟")
-
-        return "\n".join(lines)
+        return format_precious_metal_prices(prices)
 
     @filter.command("今日行情")
     async def today_market(self, event: AstrMessageEvent):
@@ -1099,113 +841,7 @@ class FundAnalyzerPlugin(Star):
             yield event.plain_result(f"❌ 分析失败: {str(e)}")
 
     def _plot_history_chart(self, history: list[dict], fund_name: str) -> str | None:
-        """
-        绘制历史行情走势图 (价格+均线+成交量) 并返回 Base64 字符串
-        """
-        try:
-            import base64
-            import io
-            import matplotlib.pyplot as plt
-            import matplotlib.gridspec as gridspec
-            import matplotlib.dates as mdates
-            import pandas as pd
-
-            # 设置中文字体，防止乱码
-            plt.rcParams["font.sans-serif"] = [
-                "SimHei",
-                "Arial Unicode MS",
-                "Microsoft YaHei",
-                "WenQuanYi Micro Hei",
-                "sans-serif",
-            ]
-            plt.rcParams["axes.unicode_minus"] = False
-
-            # 准备数据
-            df = pd.DataFrame(history)
-            if df.empty:
-                return None
-
-            df["date"] = pd.to_datetime(df["date"])
-            dates = df["date"]
-            closes = df["close"]
-            volumes = df["volume"]
-
-            # 计算均线
-            df["ma5"] = df["close"].rolling(window=5).mean()
-            df["ma10"] = df["close"].rolling(window=10).mean()
-            df["ma20"] = df["close"].rolling(window=20).mean()
-
-            # 创建画布
-            fig = plt.figure(figsize=(10, 6), dpi=100)
-            gs = gridspec.GridSpec(2, 1, height_ratios=[3, 1], hspace=0.15)
-
-            # 主图：价格 + 均线
-            ax1 = plt.subplot(gs[0])
-            ax1.plot(dates, closes, label="收盘价", color="#333333", linewidth=1.5)
-            ax1.plot(
-                dates, df["ma5"], label="MA5", color="#f5222d", linewidth=1.0, alpha=0.8
-            )
-            ax1.plot(
-                dates,
-                df["ma10"],
-                label="MA10",
-                color="#faad14",
-                linewidth=1.0,
-                alpha=0.8,
-            )
-
-            # 只有数据足够时才画MA20
-            if len(df) >= 20:
-                ax1.plot(
-                    dates,
-                    df["ma20"],
-                    label="MA20",
-                    color="#52c41a",
-                    linewidth=1.0,
-                    alpha=0.8,
-                )
-
-            ax1.set_title(f"{fund_name} - 价格走势", fontsize=14, pad=10)
-            ax1.grid(True, linestyle="--", alpha=0.3)
-            ax1.legend(loc="upper left", frameon=True, fontsize=9)
-
-            # 副图：成交量
-            ax2 = plt.subplot(gs[1], sharex=ax1)
-
-            # 根据涨跌设置颜色 (红涨绿跌)
-            colors = []
-            for i in range(len(df)):
-                if i == 0:
-                    c = "#f5222d" if df.iloc[i].get("change_rate", 0) > 0 else "#52c41a"
-                else:
-                    change = df.iloc[i]["close"] - df.iloc[i - 1]["close"]
-                    c = "#f5222d" if change >= 0 else "#52c41a"
-                colors.append(c)
-
-            ax2.bar(dates, volumes, color=colors, alpha=0.8)
-            ax2.set_ylabel("成交量", fontsize=10)
-            ax2.grid(True, linestyle="--", alpha=0.3)
-
-            # 日期格式化
-            ax1.xaxis.set_major_formatter(mdates.DateFormatter("%m-%d"))
-            plt.setp(ax1.get_xticklabels(), visible=False)  # 隐藏主图X轴标签
-            plt.gcf().autofmt_xdate()  # 自动旋转日期
-
-            plt.tight_layout()
-
-            # 保存到内存
-            buffer = io.BytesIO()
-            plt.savefig(buffer, format="png", bbox_inches="tight")
-            buffer.seek(0)
-
-            # 转 Base64
-            image_base64 = base64.b64encode(buffer.read()).decode("utf-8")
-            plt.close()
-
-            return image_base64
-        except Exception as e:
-            logger.error(f"绘图失败: {e}")
-            return None
+        return self.analysis_service.plot_history_chart(history, fund_name)
 
     @filter.command("基金历史")
     async def fund_history(
@@ -1423,6 +1059,129 @@ class FundAnalyzerPlugin(Star):
         except Exception as e:
             logger.error(f"设置默认基金出错: {e}")
             yield event.plain_result(f"❌ 设置失败: {str(e)}")
+
+    @filter.command("增加基金持仓")
+    async def add_fund_positions(self, event: AstrMessageEvent, payload: str = ""):
+        """
+        增加基金持仓（支持批量）
+        用法: 增加基金持仓 {基金代码,平均成本,持有份额}
+        示例: 增加基金持仓 {161226,1.0234,1200} {001632,2.1456,500}
+        """
+        try:
+            self._ensure_nav_sync_task()
+            raw_payload = self._extract_command_payload(event, "增加基金持仓")
+            payload_text = raw_payload or str(payload or "").strip()
+            records, error = self._parse_position_records(payload_text)
+            if error:
+                yield event.plain_result(error)
+                return
+
+            platform, user_id = self._resolve_position_owner(event)
+            if not user_id:
+                yield event.plain_result("❌ 无法识别当前用户 ID，请稍后再试")
+                return
+
+            yield event.plain_result(f"📝 正在记录 {len(records)} 条基金持仓...")
+
+            fund_infos = await self._batch_fetch_fund_infos(
+                [str(item["fund_code"]) for item in records],
+                max_concurrency=4,
+            )
+            for record in records:
+                info = fund_infos.get(str(record["fund_code"]))
+                if info and info.name:
+                    record["fund_name"] = info.name
+
+            saved_records = self.data_handler.add_or_merge_positions(
+                platform=platform,
+                user_id=user_id,
+                records=records,
+            )
+            yield event.plain_result(
+                self._format_position_add_result(saved_records, fund_infos)
+            )
+
+        except ValueError as e:
+            yield event.plain_result(f"❌ {str(e)}")
+        except Exception as e:
+            logger.error(f"增加基金持仓失败: {e}")
+            yield event.plain_result(f"❌ 持仓记录失败: {str(e)}")
+
+    @filter.command("ckcc")
+    async def check_fund_positions(self, event: AstrMessageEvent):
+        """
+        查看当前基金持仓和收益
+        用法: ckcc
+        """
+        try:
+            self._ensure_nav_sync_task()
+            platform, user_id = self._resolve_position_owner(event)
+            if not user_id:
+                yield event.plain_result("❌ 无法识别当前用户 ID，请稍后再试")
+                return
+
+            positions = self.data_handler.list_positions(platform=platform, user_id=user_id)
+            if not positions:
+                yield event.plain_result(
+                    "📭 当前没有基金持仓记录\n"
+                    "💡 用法: 增加基金持仓 {基金代码,平均成本,持有份额}\n"
+                    "💡 示例: 增加基金持仓 {161226,1.0234,1200}"
+                )
+                return
+
+            yield event.plain_result("📊 正在统计当前持仓收益...")
+            fund_infos = await self._batch_fetch_fund_infos(
+                [str(item.get("fund_code", "")) for item in positions]
+            )
+            yield event.plain_result(self._format_position_overview(positions, fund_infos))
+
+        except Exception as e:
+            logger.error(f"查看持仓失败: {e}")
+            yield event.plain_result(f"❌ 持仓查询失败: {str(e)}")
+
+    @filter.command("更新持仓基金净值")
+    async def refresh_position_fund_nav(self, event: AstrMessageEvent):
+        """
+        主动刷新当前用户持仓基金的历史净值（增量）。
+        用法: 更新持仓基金净值
+        """
+        try:
+            self._ensure_nav_sync_task()
+            platform, user_id = self._resolve_position_owner(event)
+            if not user_id:
+                yield event.plain_result("❌ 无法识别当前用户 ID，请稍后再试")
+                return
+
+            positions = self.data_handler.list_positions(platform=platform, user_id=user_id)
+            if not positions:
+                yield event.plain_result(
+                    "📭 当前没有基金持仓记录\n"
+                    "💡 请先使用：增加基金持仓 {基金代码,平均成本,持有份额}"
+                )
+                return
+
+            fund_codes: list[str] = []
+            seen_codes = set()
+            for item in positions:
+                code = str(item.get("fund_code", "")).strip()
+                if code and code not in seen_codes:
+                    seen_codes.add(code)
+                    fund_codes.append(code)
+
+            yield event.plain_result(
+                f"🔄 正在刷新你持仓的 {len(fund_codes)} 只基金净值（增量）..."
+            )
+            stats = await self._sync_position_funds_nav(
+                fund_codes=fund_codes,
+                force_full=False,
+                trigger="manual",
+            )
+            yield event.plain_result(
+                self._format_nav_sync_result(stats, "✅ 持仓基金净值刷新完成")
+            )
+        except Exception as e:
+            logger.error(f"手动刷新持仓基金净值失败: {e}")
+            yield event.plain_result(f"❌ 净值刷新失败: {str(e)}")
 
     @filter.command("智能分析")
     async def ai_fund_analysis(self, event: AstrMessageEvent, code: str = ""):
@@ -1704,128 +1463,12 @@ class FundAnalyzerPlugin(Star):
         history_b: list[dict],
         name_b: str,
     ) -> str | None:
-        """
-        绘制双基金对比走势图 (归一化收益率)
-        """
-        try:
-            import base64
-            import io
-            import matplotlib.pyplot as plt
-            import matplotlib.dates as mdates
-            import pandas as pd
-
-            # 设置中文字体
-            plt.rcParams["font.sans-serif"] = [
-                "SimHei",
-                "Arial Unicode MS",
-                "Microsoft YaHei",
-                "WenQuanYi Micro Hei",
-                "sans-serif",
-            ]
-            plt.rcParams["axes.unicode_minus"] = False
-
-            # 转换为DataFrame
-            df_a = pd.DataFrame(history_a)
-            df_b = pd.DataFrame(history_b)
-
-            if df_a.empty or df_b.empty:
-                return None
-
-            df_a["date"] = pd.to_datetime(df_a["date"])
-            df_b["date"] = pd.to_datetime(df_b["date"])
-
-            # 确保按日期排序
-            df_a = df_a.sort_values("date")
-            df_b = df_b.sort_values("date")
-
-            # 找到公共日期范围
-            common_dates = pd.merge(
-                df_a[["date"]], df_b[["date"]], on="date", how="inner"
-            )["date"]
-
-            if common_dates.empty:
-                return None
-
-            # 过滤只保留公共日期的数据
-            df_a = df_a[df_a["date"].isin(common_dates)]
-            df_b = df_b[df_b["date"].isin(common_dates)]
-
-            # 计算累计收益率 (归一化)
-            base_a = df_a.iloc[0]["close"]
-            base_b = df_b.iloc[0]["close"]
-
-            if base_a == 0 or base_b == 0:
-                return None
-
-            df_a["norm_close"] = (df_a["close"] - base_a) / base_a * 100
-            df_b["norm_close"] = (df_b["close"] - base_b) / base_b * 100
-
-            # 绘图
-            fig, ax = plt.subplots(figsize=(10, 5), dpi=100)
-
-            ax.plot(
-                df_a["date"],
-                df_a["norm_close"],
-                label=f"{name_a}",
-                color="#1890ff",
-                linewidth=2,
-            )
-            ax.plot(
-                df_b["date"],
-                df_b["norm_close"],
-                label=f"{name_b}",
-                color="#eb2f96",
-                linewidth=2,
-            )
-
-            # 填充差异区域
-            ax.fill_between(
-                df_a["date"],
-                df_a["norm_close"],
-                df_b["norm_close"],
-                where=(df_a["norm_close"] > df_b["norm_close"]),
-                interpolate=True,
-                color="#1890ff",
-                alpha=0.1,
-            )
-            ax.fill_between(
-                df_a["date"],
-                df_a["norm_close"],
-                df_b["norm_close"],
-                where=(df_a["norm_close"] < df_b["norm_close"]),
-                interpolate=True,
-                color="#eb2f96",
-                alpha=0.1,
-            )
-
-            ax.set_title("累计收益率对比 (%)", fontsize=14, pad=10)
-            ax.grid(True, linestyle="--", alpha=0.3)
-            ax.legend(loc="upper left", frameon=True)
-
-            # 格式化Y轴百分比
-            import matplotlib.ticker as mtick
-
-            ax.yaxis.set_major_formatter(mtick.PercentFormatter())
-
-            # 日期格式化
-            ax.xaxis.set_major_formatter(mdates.DateFormatter("%m-%d"))
-            plt.gcf().autofmt_xdate()
-
-            plt.tight_layout()
-
-            # 保存
-            buffer = io.BytesIO()
-            plt.savefig(buffer, format="png", bbox_inches="tight")
-            buffer.seek(0)
-
-            image_base64 = base64.b64encode(buffer.read()).decode("utf-8")
-            plt.close()
-
-            return image_base64
-
-        except Exception as e:
-            logger.error(f"对比绘图失败: {e}")
-            return None
+        return self.analysis_service.plot_comparison_chart(
+            history_a=history_a,
+            name_a=name_a,
+            history_b=history_b,
+            name_b=name_b,
+        )
 
     @filter.command("基金对比")
     async def fund_compare(
@@ -1985,6 +1628,9 @@ class FundAnalyzerPlugin(Star):
 🔹 基金历史 [代码] [天数] - 查看历史行情
 🔹 搜索基金 关键词 - 搜索LOF基金
 🔹 设置基金 代码 - 设置默认基金
+🔹 增加基金持仓 {代码,成本,份额} - 记录个人持仓（支持批量）
+🔹 ckcc - 查看当前持仓与收益
+🔹 更新持仓基金净值 - 主动刷新持仓基金净值（增量）
 🔹 基金帮助 - 显示本帮助
 ━━━━━━━━━━━━━━━━━
 💡 默认基金: 国投瑞银白银期货(LOF)A
@@ -2002,6 +1648,9 @@ class FundAnalyzerPlugin(Star):
   • 智能分析 161226
   • 基金历史 161226 20
   • 搜索基金 白银
+  • 增加基金持仓 {161226,1.0234,1200} {001632,2.1456,500}
+  • ckcc
+  • 更新持仓基金净值
 ━━━━━━━━━━━━━━━━━
 🤖 智能分析功能说明:
   调用AI大模型+量化数据，综合分析:
@@ -2016,8 +1665,8 @@ class FundAnalyzerPlugin(Star):
 💡 投资有风险，入市需谨慎！
 """.strip()
         yield event.plain_result(help_text)
-        yield event.plain_result(help_text)
 
     async def terminate(self):
         """插件停止时的清理工作"""
+        await self.nav_sync_service.stop()
         logger.info("基金分析插件已停止")
