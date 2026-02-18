@@ -34,6 +34,7 @@ from .formatters.position_formatter import (
     format_clear_position_result,
     format_nav_sync_result,
     format_position_add_result,
+    format_position_repair_result,
     format_position_overview,
 )
 from .formatters.fund_formatter import (
@@ -319,7 +320,7 @@ NAV_SYNC_FETCH_BUFFER_DAYS = 5
     "astrbot_plugin_fund_analyzer",
     "2529huang",
     "基金数据分析插件 - 使用AKShare获取LOF/ETF基金数据",
-    "1.0.0",
+    "1.1.4",
 )
 class FundAnalyzerPlugin(Star):
     """基金分析插件主类"""
@@ -598,6 +599,10 @@ class FundAnalyzerPlugin(Star):
         fund_infos: dict[str, FundInfo],
     ) -> str:
         return format_position_overview(positions, fund_infos)
+
+    @staticmethod
+    def _format_position_repair_result(stats: dict[str, Any]) -> str:
+        return format_position_repair_result(stats)
 
     @staticmethod
     def _format_clear_position_result(result: dict[str, Any]) -> str:
@@ -1445,6 +1450,64 @@ class FundAnalyzerPlugin(Star):
             logger.error(f"查看持仓失败: {e}")
             yield event.plain_result(f"❌ 持仓查询失败: {str(e)}")
 
+    @filter.command("修复基金持仓数据")
+    async def repair_fund_position_data(self, event: AstrMessageEvent):
+        """
+        修复当前用户的持仓相关基金数据（代码标准化、名称补齐、持仓重关联）。
+        用法: 修复基金持仓数据
+        """
+        try:
+            self._ensure_nav_sync_task()
+            platform, user_id = self._resolve_position_owner(event)
+            if not user_id:
+                yield event.plain_result("❌ 无法识别当前用户 ID，请稍后再试")
+                return
+
+            positions = self.data_handler.list_positions(platform=platform, user_id=user_id)
+            if not positions:
+                yield event.plain_result(
+                    "📭 当前没有基金持仓记录\n"
+                    "💡 请先使用：增加基金持仓 {基金代码,平均成本,持有份额}"
+                )
+                return
+
+            yield event.plain_result("🛠️ 正在修复你的持仓相关基金数据...")
+
+            normalized_codes: list[str] = []
+            seen_codes = set()
+            fund_name_map: dict[str, str] = {}
+            for item in positions:
+                raw_code = str(item.get("fund_code") or "").strip()
+                normalized_code = self._normalize_fund_code(raw_code) or raw_code
+                if normalized_code and normalized_code not in seen_codes:
+                    seen_codes.add(normalized_code)
+                    normalized_codes.append(normalized_code)
+                local_name = str(item.get("fund_name") or "").strip()
+                if normalized_code and local_name and normalized_code not in fund_name_map:
+                    fund_name_map[normalized_code] = local_name
+
+            fund_infos = await self._batch_fetch_fund_infos(
+                normalized_codes,
+                max_concurrency=4,
+            )
+            for code, info in fund_infos.items():
+                if info and getattr(info, "name", ""):
+                    normalized_code = self._normalize_fund_code(code) or str(code).strip()
+                    if normalized_code:
+                        fund_name_map[normalized_code] = str(info.name).strip()
+
+            stats = self.data_handler.repair_user_position_funds(
+                platform=platform,
+                user_id=user_id,
+                fund_name_map=fund_name_map,
+            )
+            yield event.plain_result(self._format_position_repair_result(stats))
+        except ValueError as e:
+            yield event.plain_result(f"❌ {str(e)}")
+        except Exception as e:
+            logger.error(f"修复基金持仓数据失败: {e}")
+            yield event.plain_result(f"❌ 修复失败: {str(e)}")
+
     @filter.command("ckqcjl")
     async def check_clear_history(self, event: AstrMessageEvent):
         """
@@ -1974,6 +2037,7 @@ class FundAnalyzerPlugin(Star):
 🔹 增加基金持仓 {代码,成本,份额} - 记录个人持仓（支持批量）
 🔹 清仓基金 [基金代码] [份额|百分比] - 卖出基金份额（默认全仓）
 🔹 ckcc - 查看当前持仓与收益
+🔹 修复基金持仓数据 - 修复当前用户的持仓相关基金数据
 🔹 ckqcjl [条数] - 查看清仓/卖出历史记录
 🔹 更新持仓基金净值 - 主动刷新持仓基金净值（增量）
 🔹 基金帮助 - 显示本帮助
@@ -1997,6 +2061,7 @@ class FundAnalyzerPlugin(Star):
   • 清仓基金 161226 25%
   • ckqcjl 20
   • ckcc
+  • 修复基金持仓数据
   • 更新持仓基金净值
 ━━━━━━━━━━━━━━━━━
 🤖 智能分析功能说明:

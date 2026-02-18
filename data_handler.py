@@ -544,6 +544,204 @@ class DataHandler:
 
         return [self._row_to_position(row) for row in rows]
 
+    def repair_user_position_funds(
+        self,
+        platform: Any,
+        user_id: Any,
+        fund_name_map: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        """
+        修复某个用户持仓相关的基金数据（仅当前用户范围）：
+        1) 规范化基金代码（如 7721 -> 007721）
+        2) 合并规范化后产生的重复持仓
+        3) 补齐/更新基金名称
+        4) 将该用户的历史日志关联到规范化后的基金
+        """
+        platform_key = self._normalize_key(platform, fallback="unknown")
+        user_key = self._normalize_key(user_id)
+        if not user_key:
+            raise ValueError("用户 ID 不能为空")
+
+        name_lookup: dict[str, str] = {}
+        for key, value in (fund_name_map or {}).items():
+            normalized_key = self._normalize_fund_code(key)
+            name_text = str(value or "").strip()
+            if normalized_key and name_text:
+                name_lookup[normalized_key] = name_text
+
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    p.platform,
+                    p.user_id,
+                    p.fund_id,
+                    f.fund_code,
+                    f.fund_name,
+                    p.avg_cost,
+                    p.shares,
+                    p.created_at,
+                    p.updated_at
+                FROM user_fund_positions p
+                JOIN funds f ON f.id = p.fund_id
+                WHERE p.platform = ? AND p.user_id = ?
+                ORDER BY f.fund_code ASC
+                """,
+                (platform_key, user_key),
+            ).fetchall()
+
+            stats: dict[str, Any] = {
+                "positions_total": len(rows),
+                "funds_total": len({int(row["fund_id"]) for row in rows}),
+                "funds_processed": 0,
+                "codes_normalized": 0,
+                "fund_names_fixed": 0,
+                "positions_relinked": 0,
+                "positions_merged": 0,
+                "logs_relinked": 0,
+                "failed": 0,
+                "errors": [],
+            }
+            if not rows:
+                return stats
+
+            conn.execute("BEGIN")
+            processed_fund_ids: set[int] = set()
+            for row in rows:
+                origin_fund_id = int(row["fund_id"])
+                if origin_fund_id in processed_fund_ids:
+                    continue
+                processed_fund_ids.add(origin_fund_id)
+                stats["funds_processed"] += 1
+
+                try:
+                    current_position = self._get_position_tx(
+                        conn=conn,
+                        platform=platform_key,
+                        user_id=user_key,
+                        fund_id=origin_fund_id,
+                    )
+                    if current_position is None:
+                        continue
+
+                    current_code = str(current_position["fund_code"] or "").strip()
+                    normalized_code = self._normalize_fund_code(current_code)
+                    if not normalized_code:
+                        raise ValueError("基金代码为空")
+
+                    target_name = str(name_lookup.get(normalized_code) or "").strip()
+                    if not target_name:
+                        target_name = str(current_position["fund_name"] or "").strip()
+
+                    target_before = self._get_fund_by_code_tx(conn, normalized_code)
+                    before_name = str(target_before["fund_name"] or "").strip() if target_before else ""
+                    target_fund = self._ensure_fund_tx(
+                        conn=conn,
+                        fund_code=normalized_code,
+                        fund_name=target_name,
+                    )
+                    target_fund_id = int(target_fund["id"])
+                    after_name = str(target_fund.get("fund_name") or "").strip()
+
+                    if target_name and after_name and after_name != before_name:
+                        stats["fund_names_fixed"] += 1
+                    if normalized_code != current_code:
+                        stats["codes_normalized"] += 1
+
+                    if target_fund_id == origin_fund_id:
+                        continue
+
+                    now_ts = int(time.time())
+                    target_position = self._get_position_tx(
+                        conn=conn,
+                        platform=platform_key,
+                        user_id=user_key,
+                        fund_id=target_fund_id,
+                    )
+                    latest_origin_position = self._get_position_tx(
+                        conn=conn,
+                        platform=platform_key,
+                        user_id=user_key,
+                        fund_id=origin_fund_id,
+                    )
+                    if latest_origin_position is None:
+                        continue
+
+                    if target_position is None:
+                        cursor = conn.execute(
+                            """
+                            UPDATE user_fund_positions
+                            SET fund_id = ?, updated_at = ?
+                            WHERE platform = ? AND user_id = ? AND fund_id = ?
+                            """,
+                            (
+                                target_fund_id,
+                                now_ts,
+                                platform_key,
+                                user_key,
+                                origin_fund_id,
+                            ),
+                        )
+                        stats["positions_relinked"] += int(cursor.rowcount or 0)
+                    else:
+                        origin_shares = float(latest_origin_position["shares"])
+                        target_shares = float(target_position["shares"])
+                        merged_shares = origin_shares + target_shares
+
+                        if merged_shares <= 0:
+                            conn.execute(
+                                """
+                                DELETE FROM user_fund_positions
+                                WHERE platform = ? AND user_id = ? AND fund_id = ?
+                                """,
+                                (platform_key, user_key, origin_fund_id),
+                            )
+                        else:
+                            origin_avg_cost = float(latest_origin_position["avg_cost"])
+                            target_avg_cost = float(target_position["avg_cost"])
+                            merged_avg_cost = (
+                                origin_avg_cost * origin_shares + target_avg_cost * target_shares
+                            ) / merged_shares
+                            conn.execute(
+                                """
+                                UPDATE user_fund_positions
+                                SET avg_cost = ?, shares = ?, updated_at = ?
+                                WHERE platform = ? AND user_id = ? AND fund_id = ?
+                                """,
+                                (
+                                    merged_avg_cost,
+                                    merged_shares,
+                                    now_ts,
+                                    platform_key,
+                                    user_key,
+                                    target_fund_id,
+                                ),
+                            )
+                            conn.execute(
+                                """
+                                DELETE FROM user_fund_positions
+                                WHERE platform = ? AND user_id = ? AND fund_id = ?
+                                """,
+                                (platform_key, user_key, origin_fund_id),
+                            )
+                        stats["positions_merged"] += 1
+
+                    log_cursor = conn.execute(
+                        """
+                        UPDATE user_fund_position_logs
+                        SET fund_id = ?
+                        WHERE platform = ? AND user_id = ? AND fund_id = ?
+                        """,
+                        (target_fund_id, platform_key, user_key, origin_fund_id),
+                    )
+                    stats["logs_relinked"] += int(log_cursor.rowcount or 0)
+                except Exception as e:
+                    stats["failed"] += 1
+                    if len(stats["errors"]) < 5:
+                        stats["errors"].append(f"{row['fund_code']}: {str(e)}")
+
+            return stats
+
     def get_position(
         self,
         platform: Any,

@@ -185,6 +185,40 @@ def format_clear_history(logs: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+def format_position_repair_result(stats: dict[str, Any]) -> str:
+    positions_total = int(stats.get("positions_total", 0) or 0)
+    funds_total = int(stats.get("funds_total", 0) or 0)
+    funds_processed = int(stats.get("funds_processed", 0) or 0)
+    codes_normalized = int(stats.get("codes_normalized", 0) or 0)
+    fund_names_fixed = int(stats.get("fund_names_fixed", 0) or 0)
+    positions_relinked = int(stats.get("positions_relinked", 0) or 0)
+    positions_merged = int(stats.get("positions_merged", 0) or 0)
+    logs_relinked = int(stats.get("logs_relinked", 0) or 0)
+    failed = int(stats.get("failed", 0) or 0)
+    errors = stats.get("errors") or []
+
+    lines = ["✅ 基金持仓数据修复完成", "━━━━━━━━━━━━━━━━━"]
+    lines.append("📌 修复范围: 仅当前发起人的持仓相关基金")
+    lines.append(f"📦 持仓记录数: {positions_total}")
+    lines.append(f"🏷️ 基金数量: {funds_total}（已处理 {funds_processed}）")
+    lines.append(f"🔢 代码标准化: {codes_normalized}")
+    lines.append(f"📝 名称补齐/更新: {fund_names_fixed}")
+    lines.append(f"🔗 持仓重关联: {positions_relinked}")
+    lines.append(f"🧮 持仓合并: {positions_merged}")
+    lines.append(f"🧾 历史记录重关联: {logs_relinked}")
+    lines.append(f"❌ 失败项: {failed}")
+
+    if errors:
+        lines.append("━━━━━━━━━━━━━━━━━")
+        lines.append("⚠️ 失败详情（最多3条）:")
+        for item in errors[:3]:
+            lines.append(f"• {item}")
+
+    lines.append("━━━━━━━━━━━━━━━━━")
+    lines.append(f"⏰ 完成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    return "\n".join(lines)
+
+
 def format_nav_sync_result(stats: dict[str, Any], title: str) -> str:
     lines = [title, "━━━━━━━━━━━━━━━━━"]
     lines.append(f"📌 目标基金数: {int(stats.get('funds_total', 0))}")

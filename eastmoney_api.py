@@ -151,6 +151,14 @@ class EastMoneyAPI:
             unique_codes.append(code_str)
         return unique_codes
 
+    @staticmethod
+    def _normalize_fund_code(fund_code: Any) -> str:
+        """标准化单个基金代码（补齐前导 0）"""
+        code_str = str(fund_code or "").strip()
+        if code_str.isdigit():
+            return code_str.zfill(6)
+        return code_str
+
     def _parse_otc_valuation_jsonp(
         self, text: str, fund_code: str
     ) -> Optional[dict]:
@@ -168,12 +176,14 @@ class EastMoneyAPI:
 
         estimate_value = self._safe_float(data.get("gsz"))
         unit_value = self._safe_float(data.get("dwjz"))
+        latest_value = estimate_value if estimate_value > 0 else unit_value
         change_amount = estimate_value - unit_value if unit_value > 0 else 0.0
 
         return {
             "code": data.get("fundcode", fund_code),
             "name": data.get("name", ""),
-            "latest_price": estimate_value,  # 兼容旧字段
+            # 估值缺失时回退到最新单位净值，保证现价可用
+            "latest_price": latest_value,  # 兼容旧字段
             "estimate_value": estimate_value,  # 估算净值
             "prev_close": unit_value,  # 兼容旧字段
             "unit_value": unit_value,  # 单位净值
@@ -353,6 +363,42 @@ class EastMoneyAPI:
         
         return False
 
+    @staticmethod
+    def _is_meaningful_realtime(data: Optional[dict]) -> bool:
+        """判断实时数据是否包含可用信息（名称或价格）"""
+        if not data:
+            return False
+        name = str(data.get("name") or "").strip()
+        latest_price = EastMoneyAPI._safe_float(data.get("latest_price"))
+        prev_close = EastMoneyAPI._safe_float(data.get("prev_close"))
+        return bool(name) or latest_price > 0 or prev_close > 0
+
+    async def _search_fund_snapshot(self, fund_code: str) -> Optional[dict]:
+        """通过搜索接口补齐基金基础信息（名称/净值）"""
+        results = await self.search_fund(fund_code, fetch_realtime=False)
+        if not results:
+            return None
+
+        normalized_target = self._normalize_fund_code(fund_code)
+        exact_match = None
+        for item in results:
+            item_code = self._normalize_fund_code(item.get("code"))
+            if item_code == normalized_target:
+                exact_match = item
+                break
+
+        if exact_match is None:
+            return None
+
+        target = exact_match
+        latest_price = self._safe_float(target.get("latest_price"))
+        return {
+            "code": self._normalize_fund_code(target.get("code")) or normalized_target,
+            "name": str(target.get("name") or "").strip(),
+            "latest_price": latest_price,
+            "prev_close": latest_price if latest_price > 0 else 0.0,
+        }
+
     async def get_fund_realtime(self, fund_code: str) -> Optional[dict]:
         """
         获取单只基金实时行情（自动判断场内/场外）
@@ -363,13 +409,64 @@ class EastMoneyAPI:
         Returns:
             行情数据字典或 None
         """
-        fund_code = str(fund_code).strip()
-        
-        # 判断是场内还是场外基金
+        fund_code = self._normalize_fund_code(fund_code)
+        if not fund_code:
+            return None
+
+        data: Optional[dict] = None
+
+        # 主路径：按代码特征判断场内/场外
         if self._is_otc_fund(fund_code):
-            return await self._get_otc_fund_realtime(fund_code)
+            data = await self._get_otc_fund_realtime(fund_code)
+            # 兜底：场外接口失败时尝试场内行情
+            if not self._is_meaningful_realtime(data):
+                fallback = await self._get_exchange_fund_realtime(fund_code)
+                if self._is_meaningful_realtime(fallback):
+                    data = fallback
         else:
-            return await self._get_exchange_fund_realtime(fund_code)
+            data = await self._get_exchange_fund_realtime(fund_code)
+            # 兜底：场内接口失败时尝试场外估值
+            if not self._is_meaningful_realtime(data):
+                fallback = await self._get_otc_fund_realtime(fund_code)
+                if self._is_meaningful_realtime(fallback):
+                    data = fallback
+
+        if not data:
+            data = {"code": fund_code}
+
+        # 价格兜底：latest_price 缺失时用可用的净值/昨收补齐
+        if self._safe_float(data.get("latest_price")) <= 0:
+            for key in ("estimate_value", "unit_value", "prev_close"):
+                fallback_price = self._safe_float(data.get(key))
+                if fallback_price > 0:
+                    data["latest_price"] = fallback_price
+                    break
+
+        # 名称或价格缺失时，使用搜索接口补齐
+        name = str(data.get("name") or "").strip()
+        latest_price = self._safe_float(data.get("latest_price"))
+        if not name or latest_price <= 0:
+            try:
+                snapshot = await self._search_fund_snapshot(fund_code)
+            except Exception as e:
+                logger.debug(f"搜索补齐基金信息失败: {fund_code}, {e}")
+                snapshot = None
+
+            if snapshot:
+                if not name and snapshot.get("name"):
+                    data["name"] = snapshot.get("name")
+                if latest_price <= 0 and self._safe_float(snapshot.get("latest_price")) > 0:
+                    data["latest_price"] = self._safe_float(snapshot.get("latest_price"))
+                if self._safe_float(data.get("prev_close")) <= 0 and self._safe_float(
+                    snapshot.get("prev_close")
+                ) > 0:
+                    data["prev_close"] = self._safe_float(snapshot.get("prev_close"))
+                if not data.get("code"):
+                    data["code"] = snapshot.get("code", fund_code)
+
+        if not self._is_meaningful_realtime(data):
+            return None
+        return data
 
     async def _get_otc_fund_realtime(self, fund_code: str) -> Optional[dict]:
         """
@@ -802,12 +899,12 @@ class EastMoneyAPI:
         results = []
         for item in datas:
             # 只处理基金类型 (CATEGORY=700)
-            category = item.get("CATEGORY")
-            if category != 700:
+            category = str(item.get("CATEGORY") or "").strip()
+            if category and category != "700":
                 continue
             
-            code = item.get("CODE", "")
-            name = item.get("NAME", "")
+            code = self._normalize_fund_code(item.get("CODE", ""))
+            name = str(item.get("NAME", "")).strip()
             
             # 获取更详细的基金信息
             fund_info = item.get("FundBaseInfo", {})
