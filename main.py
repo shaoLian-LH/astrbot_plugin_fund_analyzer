@@ -142,6 +142,47 @@ class FundAnalyzer:
             logger.error(f"获取LOF基金实时行情失败: {e}")
             return None
 
+    async def get_realtime_valuation(self, fund_code: str) -> dict | None:
+        """
+        获取场外基金实时估值（ssgz 指令使用）
+
+        Args:
+            fund_code: 基金代码
+
+        Returns:
+            估值数据字典或 None
+        """
+        fund_code = str(fund_code).strip()
+        if not fund_code:
+            return None
+
+        try:
+            return await self._api.get_fund_valuation(fund_code)
+        except Exception as e:
+            logger.error(f"获取基金实时估值失败: {e}")
+            return None
+
+    async def get_realtime_valuation_batch(
+        self, fund_codes: list[str], max_concurrency: int = 6
+    ) -> dict[str, dict]:
+        """
+        批量获取场外基金实时估值（并发）
+
+        Args:
+            fund_codes: 基金代码列表
+            max_concurrency: 最大并发数
+
+        Returns:
+            {基金代码: 估值数据}
+        """
+        try:
+            return await self._api.get_fund_valuation_batch(
+                fund_codes, max_concurrency=max_concurrency
+            )
+        except Exception as e:
+            logger.error(f"批量获取基金实时估值失败: {e}")
+            return {}
+
     async def get_lof_history(
         self, fund_code: str = None, days: int = 30, adjust: str = "qfq"
     ) -> list[dict] | None:
@@ -334,6 +375,60 @@ class FundAnalyzerPlugin(Star):
         # 补齐前导0到6位
         return code_str.zfill(6)
 
+    def _normalize_ssgz_fund_code(self, code: str | int | None) -> str | None:
+        """标准化并校验 ssgz 使用的基金代码（6位数字）"""
+        normalized_code = self._normalize_fund_code(code)
+        if not normalized_code:
+            return None
+        if len(normalized_code) != 6 or not normalized_code.isdigit():
+            return None
+        return normalized_code
+
+    @staticmethod
+    def _ssgz_usage_text() -> str:
+        """ssgz 命令用法文本"""
+        return (
+            "❌ 请输入基金代码\n"
+            "💡 用法: ssgz <基金代码>\n"
+            "💡 示例: ssgz 001632"
+        )
+
+    @staticmethod
+    def _ssgz_invalid_code_text(raw_code: str) -> str:
+        """ssgz 命令代码格式错误提示"""
+        return (
+            f"❌ 基金代码格式错误: {raw_code}\n"
+            "💡 请使用 6 位数字代码，例如: ssgz 001632"
+        )
+
+    @staticmethod
+    def _ssgz_not_found_text(fund_code: str) -> str:
+        """ssgz 命令未查询到数据提示"""
+        return (
+            f"❌ 未获取到基金 {fund_code} 的实时估值\n"
+            "💡 该接口主要支持场外基金估值数据\n"
+            "💡 建议使用「搜索基金 关键词」先确认基金代码"
+        )
+
+    def _format_ssgz_fallback_text(self, fund_code: str, realtime: FundInfo) -> str:
+        """ssgz 场内基金兜底提示"""
+        return (
+            f"⚠️ 基金 {fund_code} 暂无场外估值数据，返回场内实时行情：\n\n"
+            f"{self._format_fund_info(realtime)}"
+        )
+
+    async def _query_ssgz_text(self, fund_code: str) -> str:
+        """查询 ssgz 文本结果（估值优先，场内行情兜底）"""
+        valuation = await self.analyzer.get_realtime_valuation(fund_code)
+        if valuation:
+            return self._format_realtime_valuation(valuation)
+
+        realtime = await self.analyzer.get_lof_realtime(fund_code)
+        if realtime:
+            return self._format_ssgz_fallback_text(fund_code, realtime)
+
+        return self._ssgz_not_found_text(fund_code)
+
     def _format_fund_info(self, info: FundInfo) -> str:
         """格式化基金信息为文本"""
         # 价格为0通常表示暂无数据（原始数据为NaN）
@@ -370,6 +465,48 @@ class FundAnalyzerPlugin(Star):
 ━━━━━━━━━━━━━━━━━
 🔢 基金代码: {info.code}
 ⏰ 更新时间: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+""".strip()
+
+    def _format_realtime_valuation(self, valuation: dict) -> str:
+        """格式化场外基金实时估值信息"""
+
+        def safe_float(value, default: float = 0.0) -> float:
+            if value is None:
+                return default
+            try:
+                return float(value)
+            except (ValueError, TypeError):
+                return default
+
+        code = str(valuation.get("code", "")).strip()
+        name = str(valuation.get("name", "")).strip() or "未知基金"
+        estimate_value = safe_float(
+            valuation.get("estimate_value", valuation.get("latest_price"))
+        )
+        unit_value = safe_float(valuation.get("unit_value", valuation.get("prev_close")))
+        change_rate = safe_float(valuation.get("change_rate"))
+        change_amount = safe_float(
+            valuation.get("change_amount", estimate_value - unit_value)
+        )
+        update_time = str(valuation.get("update_time", "")).strip() or "--"
+        valuation_date = str(valuation.get("valuation_date", "")).strip() or "--"
+
+        change_color = "🔴" if change_rate < 0 else "🟢" if change_rate > 0 else "⚪"
+        trend = "📈" if change_rate > 0 else "📉" if change_rate < 0 else "➡️"
+
+        return f"""
+📍 【{name}】实时估值 {trend}
+━━━━━━━━━━━━━━━━━
+💰 估算净值: {estimate_value:.4f}
+📋 单位净值: {unit_value:.4f}
+{change_color} 估算涨跌额: {change_amount:+.4f}
+{change_color} 估算涨跌幅: {change_rate:+.2f}%
+━━━━━━━━━━━━━━━━━
+🔢 基金代码: {code}
+🕐 估值时间: {update_time}
+📅 净值日期: {valuation_date}
+⏰ 查询时间: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+💡 数据来源: 天天基金估值接口（盘中为估算值）
 """.strip()
 
     def _format_analysis(self, info: FundInfo, indicators: dict) -> str:
@@ -765,6 +902,31 @@ class FundAnalyzerPlugin(Star):
         except Exception as e:
             logger.error(f"搜索股票出错: {e}")
             yield event.plain_result(f"❌ 搜索失败: {str(e)}")
+
+    @filter.command("ssgz")
+    async def fund_realtime_valuation(self, event: AstrMessageEvent, code: str = ""):
+        """
+        查询场外基金实时估值
+        用法: ssgz <基金代码>
+        示例: ssgz 001632
+        """
+        try:
+            raw_code = str(code).strip()
+            if not raw_code:
+                yield event.plain_result(self._ssgz_usage_text())
+                return
+
+            fund_code = self._normalize_ssgz_fund_code(raw_code)
+            if not fund_code:
+                yield event.plain_result(self._ssgz_invalid_code_text(raw_code))
+                return
+
+            yield event.plain_result(f"🔍 正在查询基金 {fund_code} 的实时估值...")
+            yield event.plain_result(await self._query_ssgz_text(fund_code))
+
+        except Exception as e:
+            logger.error(f"查询基金实时估值出错: {e}")
+            yield event.plain_result(f"❌ 查询失败: {str(e)}")
 
     @filter.command("基金")
     async def fund_query(self, event: AstrMessageEvent, code: str = ""):
@@ -1814,6 +1976,7 @@ class FundAnalyzerPlugin(Star):
 🔹 搜索股票 关键词 - 搜索A股股票
 ━━━━━━━━━━━━━━━━━
 📊 LOF基金功能:
+🔹 ssgz <代码> - 查询基金实时估值（场外基金）
 🔹 基金 [代码] - 查询基金实时行情
 🔹 基金分析 [代码] - 技术分析(均线/趋势)
 🔹 基金对比 [代码1] [代码2] - ⚖️对比两只基金
@@ -1831,6 +1994,7 @@ class FundAnalyzerPlugin(Star):
   • 今日行情 (金银价格)
   • 股票 000001 (平安银行)
   • 搜索股票 茅台
+  • ssgz 001632
   • 基金 161226
   • 基金分析
   • 基金对比 161226 513100

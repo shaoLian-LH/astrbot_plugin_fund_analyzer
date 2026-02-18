@@ -7,8 +7,9 @@
 import asyncio
 import json
 import re
+import time
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Any, Optional
 import aiohttp
 import random
 
@@ -42,6 +43,45 @@ HEADERS_LIST = [
     },
 ]
 
+# 伪 IP 前缀池（用于降低同一来源高频请求的风控概率）
+PSEUDO_IP_PREFIXES = [
+    "1.12",
+    "14.17",
+    "27.38",
+    "36.112",
+    "39.155",
+    "42.120",
+    "58.30",
+    "59.63",
+    "101.6",
+    "111.13",
+    "112.64",
+    "113.87",
+    "114.80",
+    "115.28",
+    "116.62",
+    "117.79",
+    "118.89",
+    "119.29",
+    "120.92",
+    "121.40",
+    "123.125",
+    "124.65",
+    "125.88",
+    "139.196",
+    "140.205",
+    "175.24",
+    "180.76",
+    "182.254",
+    "183.60",
+    "218.30",
+    "219.135",
+    "221.179",
+    "222.73",
+]
+
+OTC_JSONP_PATTERN = re.compile(r"jsonpgz\((.*?)\)\s*;?\s*$", re.S)
+
 # 超时设置
 REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=30, connect=15)
 
@@ -69,6 +109,103 @@ class EastMoneyAPI:
         self._lof_cache_time: Optional[datetime] = None
         self._cache_ttl = 1800  # 30分钟缓存
 
+    @staticmethod
+    def _safe_float(value: Any, default: float = 0.0) -> float:
+        """安全转换为浮点数"""
+        if value is None or value == "":
+            return default
+        try:
+            return float(value)
+        except (ValueError, TypeError):
+            return default
+
+    @staticmethod
+    def _with_cache_buster(params: Optional[dict], key: str) -> dict:
+        """为请求参数补充防缓存时间戳"""
+        request_params = dict(params or {})
+        request_params.setdefault(key, str(int(time.time() * 1000)))
+        return request_params
+
+    @staticmethod
+    def _create_connector() -> aiohttp.TCPConnector:
+        """创建连接器（禁用代理，减少连接复用问题）"""
+        return aiohttp.TCPConnector(
+            ssl=False,
+            force_close=True,
+            enable_cleanup_closed=True,
+        )
+
+    def _normalize_fund_codes(self, fund_codes: list[str]) -> list[str]:
+        """去重并标准化基金代码列表"""
+        unique_codes: list[str] = []
+        seen = set()
+        for code in fund_codes:
+            code_str = str(code).strip()
+            if not code_str:
+                continue
+            if code_str.isdigit():
+                code_str = code_str.zfill(6)
+            if code_str in seen:
+                continue
+            seen.add(code_str)
+            unique_codes.append(code_str)
+        return unique_codes
+
+    def _parse_otc_valuation_jsonp(
+        self, text: str, fund_code: str
+    ) -> Optional[dict]:
+        """解析场外基金 JSONP 估值响应"""
+        match = OTC_JSONP_PATTERN.search(text.strip())
+        if not match:
+            logger.debug(f"场外基金估值响应格式异常: {fund_code}")
+            return None
+
+        try:
+            data = json.loads(match.group(1))
+        except json.JSONDecodeError as e:
+            logger.debug(f"场外基金估值 JSON 解析失败: {fund_code}, {e}")
+            return None
+
+        estimate_value = self._safe_float(data.get("gsz"))
+        unit_value = self._safe_float(data.get("dwjz"))
+        change_amount = estimate_value - unit_value if unit_value > 0 else 0.0
+
+        return {
+            "code": data.get("fundcode", fund_code),
+            "name": data.get("name", ""),
+            "latest_price": estimate_value,  # 兼容旧字段
+            "estimate_value": estimate_value,  # 估算净值
+            "prev_close": unit_value,  # 兼容旧字段
+            "unit_value": unit_value,  # 单位净值
+            "change_rate": self._safe_float(data.get("gszzl")),  # 估算涨跌幅
+            "change_amount": change_amount,  # 估算涨跌额
+            "update_time": data.get("gztime", ""),
+            "valuation_date": data.get("jzrq", ""),
+            "is_otc": True,  # 标记为场外基金
+        }
+
+    def _random_pseudo_ip(self) -> str:
+        """生成伪造来源 IP（请求头层面）"""
+        prefix = random.choice(PSEUDO_IP_PREFIXES)
+        return f"{prefix}.{random.randint(1, 254)}.{random.randint(1, 254)}"
+
+    def _build_headers(self, referer: str = "https://quote.eastmoney.com/") -> dict:
+        """构建请求头：随机 UA + 伪 IP 池"""
+        headers = dict(random.choice(HEADERS_LIST))
+        fake_ip = self._random_pseudo_ip()
+        headers.update(
+            {
+                "Referer": referer,
+                "Cache-Control": "no-cache",
+                "Pragma": "no-cache",
+                "X-Forwarded-For": fake_ip,
+                "X-Real-IP": fake_ip,
+                "CLIENT-IP": fake_ip,
+                "Forwarded": f"for={fake_ip};proto=https",
+            }
+        )
+        return headers
+
     async def _request(
         self,
         url: str,
@@ -88,15 +225,12 @@ class EastMoneyAPI:
         """
         for attempt in range(max_retries):
             try:
-                # 随机选择请求头
-                headers = random.choice(HEADERS_LIST)
+                # 随机请求头 + 防缓存参数
+                headers = self._build_headers()
+                request_params = self._with_cache_buster(params, "_")
                 
                 # 创建 connector，禁用代理
-                connector = aiohttp.TCPConnector(
-                    ssl=False,
-                    force_close=True,
-                    enable_cleanup_closed=True,
-                )
+                connector = self._create_connector()
                 
                 async with aiohttp.ClientSession(
                     headers=headers,
@@ -104,7 +238,7 @@ class EastMoneyAPI:
                     connector=connector,
                     trust_env=False,  # 忽略系统代理设置
                 ) as session:
-                    async with session.get(url, params=params) as response:
+                    async with session.get(url, params=request_params) as response:
                         if response.status == 200:
                             # 有些 API 返回 text/plain，需要手动解析 JSON
                             text = await response.text()
@@ -127,6 +261,45 @@ class EastMoneyAPI:
                 wait_time = (attempt + 1) * 3 + random.uniform(0, 2)
                 await asyncio.sleep(wait_time)
         
+        return None
+
+    async def _request_text(
+        self,
+        url: str,
+        params: Optional[dict] = None,
+        referer: str = "https://fund.eastmoney.com/",
+        max_retries: int = 3,
+    ) -> Optional[str]:
+        """发送文本请求（用于 JSONP 接口）"""
+        for attempt in range(max_retries):
+            try:
+                headers = self._build_headers(referer=referer)
+                request_params = self._with_cache_buster(params, "rt")
+                connector = self._create_connector()
+
+                async with aiohttp.ClientSession(
+                    headers=headers,
+                    timeout=REQUEST_TIMEOUT,
+                    connector=connector,
+                    trust_env=False,
+                ) as session:
+                    async with session.get(url, params=request_params) as response:
+                        if response.status == 200:
+                            return await response.text()
+                        if response.status == 404:
+                            return None
+                        logger.warning(f"HTTP {response.status}: {url}")
+            except asyncio.TimeoutError:
+                logger.warning(f"请求超时 (第{attempt + 1}次): {url}")
+            except aiohttp.ClientError as e:
+                logger.warning(f"请求失败 (第{attempt + 1}次): {e}")
+            except Exception as e:
+                logger.error(f"请求异常: {e}")
+
+            if attempt < max_retries - 1:
+                wait_time = (attempt + 1) * 2 + random.uniform(0, 1)
+                await asyncio.sleep(wait_time)
+
         return None
 
     def _get_market_code(self, fund_code: str) -> str:
@@ -209,54 +382,74 @@ class EastMoneyAPI:
             估值数据字典或 None
         """
         url = self.OTC_FUND_API.format(fund_code)
-        
-        for attempt in range(3):
-            try:
-                headers = random.choice(HEADERS_LIST)
-                connector = aiohttp.TCPConnector(ssl=False, force_close=True)
-                
-                async with aiohttp.ClientSession(
-                    headers=headers,
-                    timeout=REQUEST_TIMEOUT,
-                    connector=connector,
-                    trust_env=False,
-                ) as session:
-                    async with session.get(url) as response:
-                        if response.status == 200:
-                            text = await response.text()
-                            # 解析 JSONP: jsonpgz({...})
-                            match = re.search(r'jsonpgz\((.*)\)', text)
-                            if match:
-                                data = json.loads(match.group(1))
-                                
-                                def safe_float(val):
-                                    if val is None or val == "":
-                                        return 0.0
-                                    try:
-                                        return float(val)
-                                    except (ValueError, TypeError):
-                                        return 0.0
-                                
-                                return {
-                                    "code": data.get("fundcode", fund_code),
-                                    "name": data.get("name", ""),
-                                    "latest_price": safe_float(data.get("gsz")),  # 估算净值
-                                    "prev_close": safe_float(data.get("dwjz")),  # 昨日净值
-                                    "change_rate": safe_float(data.get("gszzl")),  # 估算涨跌幅
-                                    "change_amount": 0.0,
-                                    "update_time": data.get("gztime", ""),
-                                    "is_otc": True,  # 标记为场外基金
-                                }
-                        elif response.status == 404:
-                            # 基金不存在
-                            return None
-            except Exception as e:
-                logger.debug(f"获取场外基金估值失败 (第{attempt + 1}次): {e}")
-            
-            if attempt < 2:
-                await asyncio.sleep((attempt + 1) * 2)
-        
-        return None
+        text = await self._request_text(
+            url=url,
+            params={"rt": str(int(time.time() * 1000))},
+            referer=f"https://fund.eastmoney.com/{fund_code}.html",
+            max_retries=3,
+        )
+        if not text:
+            return None
+
+        return self._parse_otc_valuation_jsonp(text, fund_code)
+
+    async def get_fund_valuation(self, fund_code: str) -> Optional[dict]:
+        """
+        获取场外基金实时估值（ssgz 指令使用）
+
+        Args:
+            fund_code: 基金代码
+
+        Returns:
+            估值数据字典或 None
+        """
+        fund_code = str(fund_code).strip()
+        if not fund_code:
+            return None
+        return await self._get_otc_fund_realtime(fund_code)
+
+    async def get_fund_valuation_batch(
+        self,
+        fund_codes: list[str],
+        max_concurrency: int = 6,
+    ) -> dict[str, dict]:
+        """
+        批量获取场外基金实时估值（并发 + 伪IP池）
+
+        Args:
+            fund_codes: 基金代码列表
+            max_concurrency: 最大并发数
+
+        Returns:
+            {基金代码: 估值数据}
+        """
+        if not fund_codes:
+            return {}
+
+        unique_codes = self._normalize_fund_codes(fund_codes)
+        if not unique_codes:
+            return {}
+
+        concurrency = max(1, min(max_concurrency, 20))
+        semaphore = asyncio.Semaphore(concurrency)
+
+        async def fetch_one(code: str):
+            async with semaphore:
+                data = await self.get_fund_valuation(code)
+                return code, data
+
+        tasks = [asyncio.create_task(fetch_one(code)) for code in unique_codes]
+        raw_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        results: dict[str, dict] = {}
+        for item in raw_results:
+            if isinstance(item, Exception):
+                continue
+            code, data = item
+            if data:
+                results[code] = data
+
+        return results
 
     async def _get_exchange_fund_realtime(self, fund_code: str) -> Optional[dict]:
         """
