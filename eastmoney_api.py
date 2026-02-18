@@ -159,6 +159,15 @@ class EastMoneyAPI:
             return code_str.zfill(6)
         return code_str
 
+    @staticmethod
+    def _price_gap_ratio(price_a: Any, price_b: Any) -> float:
+        """计算两价格偏离比例（以 price_b 为基准）"""
+        a = EastMoneyAPI._safe_float(price_a)
+        b = EastMoneyAPI._safe_float(price_b)
+        if a <= 0 or b <= 0:
+            return 0.0
+        return abs(a - b) / b
+
     def _parse_otc_valuation_jsonp(
         self, text: str, fund_code: str
     ) -> Optional[dict]:
@@ -397,6 +406,29 @@ class EastMoneyAPI:
             "name": str(target.get("name") or "").strip(),
             "latest_price": latest_price,
             "prev_close": latest_price if latest_price > 0 else 0.0,
+            "fund_type": str(target.get("fund_type") or "").strip(),
+            "nav_date": str(target.get("nav_date") or "").strip(),
+        }
+
+    async def _get_otc_latest_nav_snapshot(self, fund_code: str) -> Optional[dict]:
+        """通过历史净值渠道获取最新单位净值快照"""
+        history = await self._get_otc_fund_history(fund_code, days=2)
+        if not history:
+            return None
+
+        latest = history[-1]
+        latest_price = self._safe_float(latest.get("close"))
+        if latest_price <= 0:
+            return None
+
+        prev = history[-2] if len(history) >= 2 else latest
+        prev_close = self._safe_float(prev.get("close"))
+        return {
+            "code": self._normalize_fund_code(fund_code),
+            "latest_price": latest_price,
+            "prev_close": prev_close if prev_close > 0 else latest_price,
+            "change_rate": self._safe_float(latest.get("change_rate")),
+            "nav_date": str(latest.get("date") or "").strip(),
         }
 
     async def get_fund_realtime(self, fund_code: str) -> Optional[dict]:
@@ -414,6 +446,7 @@ class EastMoneyAPI:
             return None
 
         data: Optional[dict] = None
+        snapshot: Optional[dict] = None
 
         # 主路径：按代码特征判断场内/场外
         if self._is_otc_fund(fund_code):
@@ -434,6 +467,74 @@ class EastMoneyAPI:
         if not data:
             data = {"code": fund_code}
 
+        # 先用搜索渠道补齐名称/净值，并处理明显冲突（如 160517 这类净值基金）
+        try:
+            snapshot = await self._search_fund_snapshot(fund_code)
+        except Exception as e:
+            logger.debug(f"搜索补齐基金信息失败: {fund_code}, {e}")
+            snapshot = None
+
+        if snapshot:
+            if not str(data.get("name") or "").strip() and snapshot.get("name"):
+                data["name"] = snapshot.get("name")
+
+            current_price = self._safe_float(data.get("latest_price"))
+            snapshot_price = self._safe_float(snapshot.get("latest_price"))
+            price_conflict = self._price_gap_ratio(current_price, snapshot_price) >= 0.2
+
+            # 场内行情缺失，或与基金净值偏差过大时，优先采用基金净值渠道
+            if snapshot_price > 0 and (current_price <= 0 or price_conflict):
+                data["latest_price"] = snapshot_price
+                data["price_source"] = "fund_search"
+                if snapshot.get("name"):
+                    data["name"] = snapshot.get("name")
+                snapshot_prev_close = self._safe_float(snapshot.get("prev_close"))
+                if snapshot_prev_close > 0:
+                    data["prev_close"] = snapshot_prev_close
+
+            if self._safe_float(data.get("prev_close")) <= 0 and self._safe_float(
+                snapshot.get("prev_close")
+            ) > 0:
+                data["prev_close"] = self._safe_float(snapshot.get("prev_close"))
+            if not data.get("code"):
+                data["code"] = snapshot.get("code", fund_code)
+
+        # 历史净值兜底（渠道三）：若当前价格仍不可用，或与净值渠道偏离过大，则回退到最新净值
+        current_price = self._safe_float(data.get("latest_price"))
+        snapshot_price = self._safe_float(snapshot.get("latest_price")) if snapshot else 0.0
+        should_try_nav = current_price <= 0 or self._price_gap_ratio(current_price, snapshot_price) >= 0.2
+        if should_try_nav:
+            try:
+                nav_snapshot = await self._get_otc_latest_nav_snapshot(fund_code)
+            except Exception as e:
+                logger.debug(f"历史净值渠道补齐失败: {fund_code}, {e}")
+                nav_snapshot = None
+
+            if nav_snapshot:
+                nav_price = self._safe_float(nav_snapshot.get("latest_price"))
+                nav_conflict = self._price_gap_ratio(current_price, nav_price) >= 0.2
+                if nav_price > 0 and (current_price <= 0 or nav_conflict):
+                    data["latest_price"] = nav_price
+                    data["price_source"] = "fund_nav"
+                    nav_prev_close = self._safe_float(nav_snapshot.get("prev_close"))
+                    if nav_prev_close > 0:
+                        data["prev_close"] = nav_prev_close
+                    nav_change_rate = self._safe_float(nav_snapshot.get("change_rate"))
+                    if nav_change_rate:
+                        data["change_rate"] = nav_change_rate
+                    elif self._safe_float(data.get("prev_close")) > 0:
+                        change_amount = nav_price - self._safe_float(data.get("prev_close"))
+                        data["change_amount"] = change_amount
+                        data["change_rate"] = change_amount / self._safe_float(
+                            data.get("prev_close")
+                        ) * 100
+                if self._safe_float(data.get("prev_close")) <= 0 and self._safe_float(
+                    nav_snapshot.get("prev_close")
+                ) > 0:
+                    data["prev_close"] = self._safe_float(nav_snapshot.get("prev_close"))
+                if nav_snapshot.get("nav_date"):
+                    data["nav_date"] = nav_snapshot.get("nav_date")
+
         # 价格兜底：latest_price 缺失时用可用的净值/昨收补齐
         if self._safe_float(data.get("latest_price")) <= 0:
             for key in ("estimate_value", "unit_value", "prev_close"):
@@ -442,16 +543,10 @@ class EastMoneyAPI:
                     data["latest_price"] = fallback_price
                     break
 
-        # 名称或价格缺失时，使用搜索接口补齐
+        # 名称或价格缺失时，使用搜索接口二次补齐
         name = str(data.get("name") or "").strip()
         latest_price = self._safe_float(data.get("latest_price"))
         if not name or latest_price <= 0:
-            try:
-                snapshot = await self._search_fund_snapshot(fund_code)
-            except Exception as e:
-                logger.debug(f"搜索补齐基金信息失败: {fund_code}, {e}")
-                snapshot = None
-
             if snapshot:
                 if not name and snapshot.get("name"):
                     data["name"] = snapshot.get("name")
@@ -617,9 +712,31 @@ class EastMoneyAPI:
         
         # 判断是场内还是场外基金
         if self._is_otc_fund(fund_code):
-            return await self._get_otc_fund_history(fund_code, days)
-        else:
+            primary_history = await self._get_otc_fund_history(fund_code, days)
+            if primary_history:
+                return primary_history
             return await self._get_exchange_fund_history(fund_code, days, adjust)
+        else:
+            primary_history = await self._get_exchange_fund_history(fund_code, days, adjust)
+            if not primary_history:
+                return await self._get_otc_fund_history(fund_code, days)
+
+            # 场内数据与基金净值渠道偏离明显时，优先使用净值历史
+            try:
+                nav_snapshot = await self._get_otc_latest_nav_snapshot(fund_code)
+            except Exception as e:
+                logger.debug(f"历史数据渠道对比失败: {fund_code}, {e}")
+                nav_snapshot = None
+
+            if nav_snapshot and primary_history:
+                latest_close = self._safe_float(primary_history[-1].get("close"))
+                nav_price = self._safe_float(nav_snapshot.get("latest_price"))
+                if self._price_gap_ratio(latest_close, nav_price) >= 0.2:
+                    fallback_history = await self._get_otc_fund_history(fund_code, days)
+                    if fallback_history:
+                        return fallback_history
+
+            return primary_history
 
     async def _get_otc_fund_history(
         self,
@@ -916,6 +1033,12 @@ class EastMoneyAPI:
                 "latest_price": 0.0,
                 "change_rate": 0.0,
                 "change_amount": 0.0,
+                "nav_date": str(
+                    fund_info.get("PDATE")
+                    or fund_info.get("JZRQ")
+                    or fund_info.get("GXRQ")
+                    or ""
+                ).strip(),
             }
             
             # 如果有净值信息
