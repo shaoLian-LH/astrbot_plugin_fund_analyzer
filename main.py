@@ -7,7 +7,7 @@ AstrBot 基金数据分析插件
 import asyncio
 import json
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import date, datetime, time as dt_time, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +30,8 @@ from .services.nav_sync_service import NavSyncService
 from .services.market_service import MarketService
 from .services.analysis_service import AnalysisService
 from .formatters.position_formatter import (
+    format_clear_history,
+    format_clear_position_result,
     format_nav_sync_result,
     format_position_add_result,
     format_position_overview,
@@ -230,18 +232,26 @@ class FundAnalyzer:
             logger.error(f"获取LOF基金历史行情失败: {e}")
             return None
 
-    async def search_fund(self, keyword: str) -> list[dict]:
+    async def search_fund(
+        self,
+        keyword: str,
+        fetch_realtime: bool = True,
+    ) -> list[dict]:
         """
         搜索LOF基金
 
         Args:
             keyword: 搜索关键词（基金名称或代码）
+            fetch_realtime: 是否补充实时行情
 
         Returns:
             匹配的基金列表
         """
         try:
-            results = await self._api.search_fund(keyword)
+            results = await self._api.search_fund(
+                keyword,
+                fetch_realtime=fetch_realtime,
+            )
             return results
         except Exception as e:
             logger.error(f"搜索基金失败: {e}")
@@ -316,6 +326,18 @@ class FundAnalyzerPlugin(Star):
 
     # 用户设置文件名
     SETTINGS_FILE = "user_settings.json"
+    QDII_NAME_KEYWORDS = (
+        "qdii",
+        "全球",
+        "海外",
+        "美国",
+        "纳斯达克",
+        "标普",
+        "恒生",
+        "日经",
+        "道琼斯",
+        "msci",
+    )
 
     def __init__(self, context: Context):
         super().__init__(context)
@@ -437,10 +459,122 @@ class FundAnalyzerPlugin(Star):
     def _fund_position_usage_text() -> str:
         return PositionService.fund_position_usage_text()
 
+    @staticmethod
+    def _clear_position_usage_text() -> str:
+        return PositionService.clear_position_usage_text()
+
     def _parse_position_records(
         self, payload: str
     ) -> tuple[list[dict[str, Any]], str | None]:
         return self.position_service.parse_position_records(payload)
+
+    def _parse_clear_payload(self, payload: str) -> tuple[dict[str, Any] | None, str | None]:
+        return self.position_service.parse_clear_payload(payload)
+
+    def _resolve_sell_shares(
+        self,
+        holding_shares: float,
+        clear_payload: dict[str, Any],
+    ) -> tuple[float | None, str | None]:
+        return self.position_service.resolve_sell_shares(holding_shares, clear_payload)
+
+    def _is_qdii_fund(self, fund_name: str) -> bool:
+        text = str(fund_name or "").strip().lower()
+        if not text:
+            return False
+        if "qdii" in text:
+            return True
+        return any(keyword in text for keyword in self.QDII_NAME_KEYWORDS if keyword != "qdii")
+
+    @staticmethod
+    def _is_qdii_by_fund_type(fund_type: str) -> bool:
+        text = str(fund_type or "").strip().lower()
+        if not text:
+            return False
+        if "qdii" in text:
+            return True
+        return "海外" in text or "全球" in text
+
+    async def _resolve_is_qdii(self, fund_code: str, fund_name: str) -> bool:
+        code = str(fund_code or "").strip()
+        if code:
+            try:
+                search_results = await self.analyzer.search_fund(
+                    code,
+                    fetch_realtime=False,
+                )
+                for item in search_results:
+                    item_code = self._normalize_fund_code(item.get("code"))
+                    if item_code != code:
+                        continue
+                    fund_type = str(item.get("fund_type") or "").strip()
+                    if fund_type:
+                        return self._is_qdii_by_fund_type(fund_type)
+            except Exception as e:
+                logger.debug(f"通过 API 判断 QDII 失败，回退名称判断: {code}, {e}")
+        return self._is_qdii_fund(fund_name)
+
+    @staticmethod
+    def _calc_expected_settlement_date(
+        trade_time: datetime,
+        is_qdii: bool,
+    ) -> tuple[date, str]:
+        before_cutoff = trade_time.time() < dt_time(hour=15, minute=0)
+        if is_qdii:
+            base_offset = 2 if before_cutoff else 3
+            rule_text = (
+                "QDII 基金：15点前按 T+2，15点后按 T+3；若净值未更新则顺延到可用净值日"
+            )
+        else:
+            base_offset = 1 if before_cutoff else 2
+            rule_text = (
+                "非 QDII 基金：15点前按 T+1，15点后按 T+2；按结算日可用最新净值计算"
+            )
+        expected_date = trade_time.date() + timedelta(days=base_offset)
+        return expected_date, rule_text
+
+    def _resolve_settlement_nav(
+        self,
+        fund_code: str,
+        expected_settlement_date: date,
+        is_qdii: bool,
+    ) -> tuple[dict[str, Any] | None, str]:
+        expected_date_text = expected_settlement_date.isoformat()
+
+        nav = self.data_handler.get_nav_on_or_after(
+            fund_code=fund_code,
+            start_date=expected_date_text,
+            end_date=expected_date_text,
+        )
+        if nav:
+            return nav, ""
+
+        if is_qdii:
+            fallback_date_text = (expected_settlement_date + timedelta(days=1)).isoformat()
+            nav = self.data_handler.get_nav_on_or_after(
+                fund_code=fund_code,
+                start_date=fallback_date_text,
+                end_date=fallback_date_text,
+            )
+            if nav:
+                return nav, "QDII 结算日顺延 1 天后匹配到净值"
+
+        nav = self.data_handler.get_nav_on_or_after(
+            fund_code=fund_code,
+            start_date=expected_date_text,
+        )
+        if nav:
+            nav_date_text = str(nav.get("nav_date") or "").strip()
+            if nav_date_text and nav_date_text != expected_date_text:
+                return nav, f"按结算日后首个可用净值 {nav_date_text} 计算"
+            return nav, ""
+
+        latest_nav = self.data_handler.get_latest_nav_record(fund_code=fund_code)
+        if latest_nav:
+            latest_date = str(latest_nav.get("nav_date") or "").strip()
+            return latest_nav, f"未命中结算日净值，使用最新可用净值 {latest_date}"
+
+        return None, "未获取到历史净值，收益按成本价估算"
 
     async def _batch_fetch_fund_infos(
         self, fund_codes: list[str], max_concurrency: int = 6
@@ -464,6 +598,14 @@ class FundAnalyzerPlugin(Star):
         fund_infos: dict[str, FundInfo],
     ) -> str:
         return format_position_overview(positions, fund_infos)
+
+    @staticmethod
+    def _format_clear_position_result(result: dict[str, Any]) -> str:
+        return format_clear_position_result(result)
+
+    @staticmethod
+    def _format_clear_history(logs: list[dict[str, Any]]) -> str:
+        return format_clear_history(logs)
 
     def _ensure_nav_sync_task(self) -> None:
         self.nav_sync_service.ensure_task()
@@ -1107,6 +1249,170 @@ class FundAnalyzerPlugin(Star):
             logger.error(f"增加基金持仓失败: {e}")
             yield event.plain_result(f"❌ 持仓记录失败: {str(e)}")
 
+    @filter.command("清仓基金")
+    async def clear_fund_position(self, event: AstrMessageEvent, payload: str = ""):
+        """
+        清仓或卖出指定基金份额（支持按份额或百分比）
+        用法: 清仓基金 [基金代码] [份额|百分比]
+        示例: 清仓基金 161226 500
+        示例: 清仓基金 161226 25%
+        """
+        try:
+            self._ensure_nav_sync_task()
+            raw_payload = self._extract_command_payload(event, "清仓基金")
+            payload_text = raw_payload or str(payload or "").strip()
+            clear_payload, error = self._parse_clear_payload(payload_text)
+            if error:
+                yield event.plain_result(error)
+                return
+            if not clear_payload:
+                yield event.plain_result(self._clear_position_usage_text())
+                return
+
+            platform, user_id = self._resolve_position_owner(event)
+            if not user_id:
+                yield event.plain_result("❌ 无法识别当前用户 ID，请稍后再试")
+                return
+
+            positions = self.data_handler.list_positions(platform=platform, user_id=user_id)
+            if not positions:
+                yield event.plain_result(
+                    "📭 当前没有基金持仓记录\n"
+                    "💡 请先使用：增加基金持仓 {基金代码,平均成本,持有份额}"
+                )
+                return
+
+            position_map: dict[str, dict[str, Any]] = {}
+            for item in positions:
+                code = str(item.get("fund_code") or "").strip()
+                if code:
+                    position_map[code] = item
+
+            target_code = str(clear_payload.get("fund_code") or "").strip()
+            if not target_code:
+                sender_id = str(event.get_sender_id() or "").strip()
+                default_code = self._normalize_fund_code(self._get_user_fund(sender_id))
+                if default_code and default_code in position_map:
+                    target_code = default_code
+                elif len(position_map) == 1:
+                    target_code = next(iter(position_map.keys()))
+                else:
+                    available_codes = "、".join(sorted(position_map.keys())[:8])
+                    yield event.plain_result(
+                        "❌ 你当前持有多只基金，请指定基金代码\n"
+                        "💡 用法: 清仓基金 [基金代码] [份额|百分比]\n"
+                        f"💡 当前持仓代码: {available_codes}"
+                    )
+                    return
+
+            position = position_map.get(target_code)
+            if position is None:
+                yield event.plain_result(
+                    f"❌ 未找到基金 {target_code} 的持仓记录\n"
+                    "💡 使用 ckcc 查看当前持仓"
+                )
+                return
+
+            holding_shares = float(position.get("shares", 0) or 0)
+            sell_shares, error = self._resolve_sell_shares(holding_shares, clear_payload)
+            if error:
+                yield event.plain_result(error)
+                return
+            if sell_shares is None or sell_shares <= 0:
+                yield event.plain_result("❌ 卖出份额必须大于 0")
+                return
+
+            yield event.plain_result("🧮 正在计算清仓结算净值并更新持仓...")
+
+            try:
+                await self._sync_position_funds_nav(
+                    fund_codes=[target_code],
+                    force_full=False,
+                    trigger="clear",
+                )
+            except Exception as sync_error:
+                logger.debug(f"清仓前增量刷新净值失败: {sync_error}")
+
+            fund_infos = await self._batch_fetch_fund_infos(
+                [target_code],
+                max_concurrency=2,
+            )
+            info = fund_infos.get(target_code)
+            fund_name = (
+                info.name
+                if info and getattr(info, "name", "")
+                else str(position.get("fund_name") or "").strip()
+            )
+            if not fund_name:
+                fund_name = target_code
+
+            is_qdii = await self._resolve_is_qdii(
+                fund_code=target_code,
+                fund_name=fund_name,
+            )
+            trade_time = datetime.now()
+            expected_settlement_date, settlement_rule = self._calc_expected_settlement_date(
+                trade_time=trade_time,
+                is_qdii=is_qdii,
+            )
+            nav_record, nav_note = self._resolve_settlement_nav(
+                fund_code=target_code,
+                expected_settlement_date=expected_settlement_date,
+                is_qdii=is_qdii,
+            )
+
+            avg_cost = float(position.get("avg_cost", 0) or 0)
+            settlement_nav = None
+            settlement_nav_date = None
+            if nav_record:
+                nav_value = float(nav_record.get("unit_nav", 0) or 0)
+                if nav_value > 0:
+                    settlement_nav = nav_value
+                nav_date_text = str(nav_record.get("nav_date") or "").strip()
+                settlement_nav_date = nav_date_text or None
+
+            settlement_for_profit = settlement_nav if settlement_nav and settlement_nav > 0 else avg_cost
+            profit_amount = (settlement_for_profit - avg_cost) * float(sell_shares)
+            action = "clear" if float(sell_shares) >= holding_shares - 1e-8 else "sell"
+
+            if clear_payload.get("share_mode") == "all":
+                requested_text = "全仓"
+            elif clear_payload.get("share_mode") == "percent":
+                requested_text = f"{clear_payload.get('share_raw', '')} (银行家舍入)"
+            else:
+                requested_text = str(clear_payload.get("share_raw") or "").strip()
+
+            result = self.data_handler.reduce_position_with_log(
+                platform=platform,
+                user_id=user_id,
+                fund_code=target_code,
+                shares=sell_shares,
+                action=action,
+                settlement_nav=settlement_nav,
+                settlement_nav_date=settlement_nav_date,
+                expected_settlement_date=expected_settlement_date.isoformat(),
+                settlement_rule=settlement_rule,
+                profit_amount=profit_amount,
+                note=nav_note,
+                fund_name=fund_name,
+            )
+
+            result["fund_name"] = fund_name
+            result["settlement_nav"] = settlement_nav
+            result["settlement_nav_date"] = settlement_nav_date
+            result["expected_settlement_date"] = expected_settlement_date.isoformat()
+            result["settlement_rule"] = settlement_rule
+            result["profit_amount"] = profit_amount
+            result["requested_text"] = requested_text
+
+            yield event.plain_result(self._format_clear_position_result(result))
+
+        except ValueError as e:
+            yield event.plain_result(f"❌ {str(e)}")
+        except Exception as e:
+            logger.error(f"清仓基金失败: {e}")
+            yield event.plain_result(f"❌ 清仓失败: {str(e)}")
+
     @filter.command("ckcc")
     async def check_fund_positions(self, event: AstrMessageEvent):
         """
@@ -1138,6 +1444,43 @@ class FundAnalyzerPlugin(Star):
         except Exception as e:
             logger.error(f"查看持仓失败: {e}")
             yield event.plain_result(f"❌ 持仓查询失败: {str(e)}")
+
+    @filter.command("ckqcjl")
+    async def check_clear_history(self, event: AstrMessageEvent):
+        """
+        查看清仓/卖出历史记录
+        用法: ckqcjl [条数]
+        """
+        try:
+            payload_text = self._extract_command_payload(event, "ckqcjl")
+            limit = 30
+            if payload_text:
+                try:
+                    limit = int(payload_text.strip())
+                except ValueError:
+                    yield event.plain_result("❌ 条数必须是数字\n💡 用法: ckqcjl [条数]")
+                    return
+            limit = max(1, min(limit, 100))
+
+            platform, user_id = self._resolve_position_owner(event)
+            if not user_id:
+                yield event.plain_result("❌ 无法识别当前用户 ID，请稍后再试")
+                return
+
+            logs = self.data_handler.list_position_logs(
+                platform=platform,
+                user_id=user_id,
+                limit=limit,
+                actions=["sell", "clear"],
+            )
+            if not logs:
+                yield event.plain_result("📭 暂无清仓/卖出历史记录")
+                return
+
+            yield event.plain_result(self._format_clear_history(logs))
+        except Exception as e:
+            logger.error(f"查看清仓历史失败: {e}")
+            yield event.plain_result(f"❌ 清仓历史查询失败: {str(e)}")
 
     @filter.command("更新持仓基金净值")
     async def refresh_position_fund_nav(self, event: AstrMessageEvent):
@@ -1629,7 +1972,9 @@ class FundAnalyzerPlugin(Star):
 🔹 搜索基金 关键词 - 搜索LOF基金
 🔹 设置基金 代码 - 设置默认基金
 🔹 增加基金持仓 {代码,成本,份额} - 记录个人持仓（支持批量）
+🔹 清仓基金 [基金代码] [份额|百分比] - 卖出基金份额（默认全仓）
 🔹 ckcc - 查看当前持仓与收益
+🔹 ckqcjl [条数] - 查看清仓/卖出历史记录
 🔹 更新持仓基金净值 - 主动刷新持仓基金净值（增量）
 🔹 基金帮助 - 显示本帮助
 ━━━━━━━━━━━━━━━━━
@@ -1649,6 +1994,8 @@ class FundAnalyzerPlugin(Star):
   • 基金历史 161226 20
   • 搜索基金 白银
   • 增加基金持仓 {161226,1.0234,1200} {001632,2.1456,500}
+  • 清仓基金 161226 25%
+  • ckqcjl 20
   • ckcc
   • 更新持仓基金净值
 ━━━━━━━━━━━━━━━━━

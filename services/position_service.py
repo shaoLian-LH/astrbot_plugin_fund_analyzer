@@ -1,5 +1,6 @@
 import asyncio
 import re
+from decimal import Decimal, ROUND_HALF_EVEN
 from typing import Any, Callable
 
 
@@ -81,6 +82,18 @@ class PositionService:
         )
 
     @staticmethod
+    def clear_position_usage_text() -> str:
+        return (
+            "❌ 清仓参数格式错误\n"
+            "💡 用法1: 清仓基金（默认按当前默认基金全仓卖出）\n"
+            "💡 用法2: 清仓基金 基金代码\n"
+            "💡 用法3: 清仓基金 [基金代码] [份额|百分比]\n"
+            "💡 示例: 清仓基金 161226 500\n"
+            "💡 示例: 清仓基金 161226 25%\n"
+            "💡 示例: 清仓基金 50%"
+        )
+
+    @staticmethod
     def parse_positive_float(value: str) -> float | None:
         try:
             number = float(str(value).strip())
@@ -141,6 +154,131 @@ class PositionService:
 
         return records, None
 
+    @staticmethod
+    def _bankers_round(value: float, digits: int = 4) -> float:
+        quantizer = Decimal("1").scaleb(-digits)
+        return float(
+            Decimal(str(value)).quantize(quantizer, rounding=ROUND_HALF_EVEN)
+        )
+
+    def parse_clear_payload(self, payload: str) -> tuple[dict[str, Any] | None, str | None]:
+        text = str(payload or "").strip()
+        if not text:
+            return {
+                "fund_code": None,
+                "share_mode": "all",
+                "share_value": None,
+                "share_raw": "",
+            }, None
+
+        tokens = [item for item in re.split(r"\s+", text) if item]
+        if len(tokens) > 2:
+            return None, self.clear_position_usage_text()
+
+        def parse_fund_code_token(code_text: str) -> str | None:
+            text_value = str(code_text or "").strip()
+            if not re.fullmatch(r"\d{6}", text_value):
+                return None
+            return self._normalize_fund_code(text_value)
+
+        def parse_share_token(share_text: str) -> tuple[dict[str, Any] | None, str | None]:
+            raw_text = str(share_text or "").strip()
+            if not raw_text:
+                return None, "❌ 卖出份额不能为空"
+
+            if raw_text.endswith("%"):
+                percent_text = raw_text[:-1].strip()
+                percent = self.parse_positive_float(percent_text)
+                if percent is None:
+                    return None, f"❌ 百分比格式错误: {raw_text}"
+                if percent > 100:
+                    return None, "❌ 百分比不能超过 100%"
+                return {
+                    "share_mode": "percent",
+                    "share_value": percent,
+                    "share_raw": raw_text,
+                }, None
+
+            shares = self.parse_positive_float(raw_text)
+            if shares is None:
+                return None, f"❌ 卖出份额必须是大于 0 的数字: {raw_text}"
+            return {
+                "share_mode": "shares",
+                "share_value": shares,
+                "share_raw": raw_text,
+            }, None
+
+        if len(tokens) == 1:
+            single = tokens[0]
+            maybe_code = parse_fund_code_token(single)
+            if maybe_code:
+                return {
+                    "fund_code": maybe_code,
+                    "share_mode": "all",
+                    "share_value": None,
+                    "share_raw": "",
+                }, None
+
+            share_part, error = parse_share_token(single)
+            if error:
+                return None, error
+            return {
+                "fund_code": None,
+                **(share_part or {}),
+            }, None
+
+        fund_code = parse_fund_code_token(tokens[0])
+        if not fund_code:
+            return None, f"❌ 基金代码格式错误: {tokens[0]}（需为 6 位数字）"
+
+        share_part, error = parse_share_token(tokens[1])
+        if error:
+            return None, error
+        return {
+            "fund_code": fund_code,
+            **(share_part or {}),
+        }, None
+
+    def resolve_sell_shares(
+        self,
+        holding_shares: float,
+        clear_payload: dict[str, Any],
+        percent_round_digits: int = 4,
+    ) -> tuple[float | None, str | None]:
+        if holding_shares <= 0:
+            return None, "❌ 当前持仓份额为 0，无法清仓"
+
+        mode = str(clear_payload.get("share_mode") or "all").strip().lower()
+        value = clear_payload.get("share_value")
+
+        if mode == "all":
+            return float(holding_shares), None
+
+        if mode == "shares":
+            shares = float(value or 0)
+            if shares <= 0:
+                return None, "❌ 卖出份额必须大于 0"
+            if shares > holding_shares + 1e-8:
+                return (
+                    None,
+                    f"❌ 卖出份额不能超过当前持仓（当前: {holding_shares:,.4f}）",
+                )
+            return shares, None
+
+        if mode == "percent":
+            percent = float(value or 0)
+            if percent <= 0 or percent > 100:
+                return None, "❌ 百分比必须在 (0, 100] 范围内"
+            raw_shares = holding_shares * percent / 100
+            shares = self._bankers_round(raw_shares, digits=percent_round_digits)
+            if shares <= 0:
+                return None, "❌ 百分比过小，按银行家舍入后卖出份额为 0"
+            if shares > holding_shares:
+                shares = float(holding_shares)
+            return shares, None
+
+        return None, "❌ 未知的清仓参数类型"
+
     async def batch_fetch_fund_infos(
         self, analyzer: Any, fund_codes: list[str], max_concurrency: int = 6
     ) -> dict[str, Any]:
@@ -177,4 +315,3 @@ class PositionService:
             if info:
                 results[code] = info
         return results
-

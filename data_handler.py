@@ -11,7 +11,7 @@ DEFAULT_DATA_PATH = DEFAULT_DB_PATH
 class DataHandler:
     """基金数据持久化处理器（基金主数据、用户持仓、历史净值）。"""
 
-    SCHEMA_VERSION = "2"
+    SCHEMA_VERSION = "3"
 
     def __init__(self, path: str = DEFAULT_DB_PATH):
         self.path = path
@@ -57,6 +57,32 @@ class DataHandler:
 
                 CREATE INDEX IF NOT EXISTS idx_user_fund_positions_user
                 ON user_fund_positions(platform, user_id);
+
+                CREATE TABLE IF NOT EXISTS user_fund_position_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    platform TEXT NOT NULL,
+                    user_id TEXT NOT NULL,
+                    fund_id INTEGER NOT NULL,
+                    action TEXT NOT NULL,
+                    shares_delta REAL NOT NULL,
+                    shares_before REAL NOT NULL,
+                    shares_after REAL NOT NULL,
+                    avg_cost REAL NOT NULL,
+                    settlement_nav REAL,
+                    settlement_nav_date TEXT,
+                    expected_settlement_date TEXT,
+                    settlement_rule TEXT NOT NULL DEFAULT '',
+                    profit_amount REAL,
+                    note TEXT NOT NULL DEFAULT '',
+                    created_at INTEGER NOT NULL,
+                    FOREIGN KEY (fund_id) REFERENCES funds(id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_user_fund_position_logs_user
+                ON user_fund_position_logs(platform, user_id, created_at DESC);
+
+                CREATE INDEX IF NOT EXISTS idx_user_fund_position_logs_action
+                ON user_fund_position_logs(action, created_at DESC);
 
                 CREATE TABLE IF NOT EXISTS fund_nav_history (
                     fund_id INTEGER NOT NULL,
@@ -166,6 +192,32 @@ class DataHandler:
             "source": str(row["source"] or ""),
             "created_at": int(row["created_at"]),
             "updated_at": int(row["updated_at"]),
+        }
+
+    def _row_to_position_log(self, row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "id": int(row["id"]),
+            "platform": str(row["platform"]),
+            "user_id": str(row["user_id"]),
+            "fund_id": int(row["fund_id"]),
+            "fund_code": str(row["fund_code"]),
+            "fund_name": str(row["fund_name"] or ""),
+            "action": str(row["action"]),
+            "shares_delta": float(row["shares_delta"]),
+            "shares_before": float(row["shares_before"]),
+            "shares_after": float(row["shares_after"]),
+            "avg_cost": float(row["avg_cost"]),
+            "settlement_nav": (
+                None if row["settlement_nav"] is None else float(row["settlement_nav"])
+            ),
+            "settlement_nav_date": str(row["settlement_nav_date"] or ""),
+            "expected_settlement_date": str(row["expected_settlement_date"] or ""),
+            "settlement_rule": str(row["settlement_rule"] or ""),
+            "profit_amount": (
+                None if row["profit_amount"] is None else float(row["profit_amount"])
+            ),
+            "note": str(row["note"] or ""),
+            "created_at": int(row["created_at"]),
         }
 
     def _get_fund_by_code_tx(
@@ -307,6 +359,33 @@ class DataHandler:
             WHERE p.platform = ? AND p.user_id = ? AND p.fund_id = ?
             """,
             (platform, user_id, fund_id),
+        )
+        return cursor.fetchone()
+
+    def _get_position_by_code_tx(
+        self,
+        conn: sqlite3.Connection,
+        platform: str,
+        user_id: str,
+        fund_code: str,
+    ) -> sqlite3.Row | None:
+        cursor = conn.execute(
+            """
+            SELECT
+                p.platform,
+                p.user_id,
+                p.fund_id,
+                f.fund_code,
+                f.fund_name,
+                p.avg_cost,
+                p.shares,
+                p.created_at,
+                p.updated_at
+            FROM user_fund_positions p
+            JOIN funds f ON f.id = p.fund_id
+            WHERE p.platform = ? AND p.user_id = ? AND f.fund_code = ?
+            """,
+            (platform, user_id, fund_code),
         )
         return cursor.fetchone()
 
@@ -464,6 +543,402 @@ class DataHandler:
             ).fetchall()
 
         return [self._row_to_position(row) for row in rows]
+
+    def get_position(
+        self,
+        platform: Any,
+        user_id: Any,
+        fund_code: Any,
+    ) -> dict[str, Any] | None:
+        platform_key = self._normalize_key(platform, fallback="unknown")
+        user_key = self._normalize_key(user_id)
+        code = self._normalize_fund_code(fund_code)
+        if not user_key or not code:
+            return None
+
+        with self._connect() as conn:
+            row = self._get_position_by_code_tx(
+                conn=conn,
+                platform=platform_key,
+                user_id=user_key,
+                fund_code=code,
+            )
+            if row is None:
+                return None
+            return self._row_to_position(row)
+
+    def reduce_position(
+        self,
+        platform: Any,
+        user_id: Any,
+        fund_code: Any,
+        shares: Any,
+    ) -> dict[str, Any]:
+        platform_key = self._normalize_key(platform, fallback="unknown")
+        user_key = self._normalize_key(user_id)
+        code = self._normalize_fund_code(fund_code)
+        if not user_key:
+            raise ValueError("用户 ID 不能为空")
+        if not code:
+            raise ValueError("基金代码不能为空")
+
+        shares_num = self._as_positive_float(shares, "卖出份额")
+
+        with self._connect() as conn:
+            conn.execute("BEGIN")
+            row = self._get_position_by_code_tx(
+                conn=conn,
+                platform=platform_key,
+                user_id=user_key,
+                fund_code=code,
+            )
+            if row is None:
+                raise ValueError(f"未找到基金 {code} 的持仓记录")
+
+            current_shares = float(row["shares"])
+            if shares_num > current_shares + 1e-8:
+                raise ValueError(
+                    f"卖出份额不能超过当前持有份额（当前: {current_shares:,.4f}）"
+                )
+
+            remaining = current_shares - shares_num
+            now_ts = int(time.time())
+            deleted = False
+            if remaining <= 1e-8:
+                remaining = 0.0
+                deleted = True
+                conn.execute(
+                    """
+                    DELETE FROM user_fund_positions
+                    WHERE platform = ? AND user_id = ? AND fund_id = ?
+                    """,
+                    (platform_key, user_key, int(row["fund_id"])),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE user_fund_positions
+                    SET shares = ?, updated_at = ?
+                    WHERE platform = ? AND user_id = ? AND fund_id = ?
+                    """,
+                    (
+                        remaining,
+                        now_ts,
+                        platform_key,
+                        user_key,
+                        int(row["fund_id"]),
+                    ),
+                )
+
+            return {
+                "platform": platform_key,
+                "user_id": user_key,
+                "fund_id": int(row["fund_id"]),
+                "fund_code": str(row["fund_code"]),
+                "fund_name": str(row["fund_name"] or ""),
+                "avg_cost": float(row["avg_cost"]),
+                "shares_before": current_shares,
+                "shares_sold": shares_num,
+                "shares_after": remaining,
+                "position_deleted": deleted,
+            }
+
+    def reduce_position_with_log(
+        self,
+        platform: Any,
+        user_id: Any,
+        fund_code: Any,
+        shares: Any,
+        action: Any,
+        settlement_nav: Any = None,
+        settlement_nav_date: Any = None,
+        expected_settlement_date: Any = None,
+        settlement_rule: Any = "",
+        profit_amount: Any = None,
+        note: Any = "",
+        fund_name: str = "",
+    ) -> dict[str, Any]:
+        platform_key = self._normalize_key(platform, fallback="unknown")
+        user_key = self._normalize_key(user_id)
+        code = self._normalize_fund_code(fund_code)
+        action_text = str(action or "").strip().lower()
+        if not user_key:
+            raise ValueError("用户 ID 不能为空")
+        if not code:
+            raise ValueError("基金代码不能为空")
+        if not action_text:
+            raise ValueError("操作类型不能为空")
+
+        shares_num = self._as_positive_float(shares, "卖出份额")
+        settlement_nav_num = None if settlement_nav is None else float(settlement_nav)
+        settlement_nav_date_text = (
+            self._normalize_nav_date(settlement_nav_date) if settlement_nav_date else None
+        )
+        expected_settlement_date_text = (
+            self._normalize_nav_date(expected_settlement_date)
+            if expected_settlement_date
+            else None
+        )
+        settlement_rule_text = str(settlement_rule or "").strip()
+        profit_amount_num = None if profit_amount is None else float(profit_amount)
+        note_text = str(note or "").strip()
+        fund_name_text = str(fund_name or "").strip()
+
+        with self._connect() as conn:
+            conn.execute("BEGIN")
+            row = self._get_position_by_code_tx(
+                conn=conn,
+                platform=platform_key,
+                user_id=user_key,
+                fund_code=code,
+            )
+            if row is None:
+                raise ValueError(f"未找到基金 {code} 的持仓记录")
+
+            if fund_name_text:
+                self._ensure_fund_tx(
+                    conn=conn,
+                    fund_code=code,
+                    fund_name=fund_name_text,
+                )
+
+            current_shares = float(row["shares"])
+            if shares_num > current_shares + 1e-8:
+                raise ValueError(
+                    f"卖出份额不能超过当前持有份额（当前: {current_shares:,.4f}）"
+                )
+
+            remaining = current_shares - shares_num
+            now_ts = int(time.time())
+            deleted = False
+            if remaining <= 1e-8:
+                remaining = 0.0
+                deleted = True
+                conn.execute(
+                    """
+                    DELETE FROM user_fund_positions
+                    WHERE platform = ? AND user_id = ? AND fund_id = ?
+                    """,
+                    (platform_key, user_key, int(row["fund_id"])),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE user_fund_positions
+                    SET shares = ?, updated_at = ?
+                    WHERE platform = ? AND user_id = ? AND fund_id = ?
+                    """,
+                    (
+                        remaining,
+                        now_ts,
+                        platform_key,
+                        user_key,
+                        int(row["fund_id"]),
+                    ),
+                )
+
+            cursor = conn.execute(
+                """
+                INSERT INTO user_fund_position_logs (
+                    platform,
+                    user_id,
+                    fund_id,
+                    action,
+                    shares_delta,
+                    shares_before,
+                    shares_after,
+                    avg_cost,
+                    settlement_nav,
+                    settlement_nav_date,
+                    expected_settlement_date,
+                    settlement_rule,
+                    profit_amount,
+                    note,
+                    created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    platform_key,
+                    user_key,
+                    int(row["fund_id"]),
+                    action_text,
+                    -shares_num,
+                    current_shares,
+                    remaining,
+                    float(row["avg_cost"]),
+                    settlement_nav_num,
+                    settlement_nav_date_text,
+                    expected_settlement_date_text,
+                    settlement_rule_text,
+                    profit_amount_num,
+                    note_text,
+                    now_ts,
+                ),
+            )
+
+            return {
+                "platform": platform_key,
+                "user_id": user_key,
+                "fund_id": int(row["fund_id"]),
+                "fund_code": str(row["fund_code"]),
+                "fund_name": str(row["fund_name"] or ""),
+                "avg_cost": float(row["avg_cost"]),
+                "shares_before": current_shares,
+                "shares_sold": shares_num,
+                "shares_after": remaining,
+                "position_deleted": deleted,
+                "action": action_text,
+                "log_id": int(cursor.lastrowid or 0),
+            }
+
+    def add_position_log(
+        self,
+        platform: Any,
+        user_id: Any,
+        fund_code: Any,
+        action: Any,
+        shares_delta: Any,
+        shares_before: Any,
+        shares_after: Any,
+        avg_cost: Any,
+        settlement_nav: Any = None,
+        settlement_nav_date: Any = None,
+        expected_settlement_date: Any = None,
+        settlement_rule: Any = "",
+        profit_amount: Any = None,
+        note: Any = "",
+        fund_name: str = "",
+    ) -> int:
+        platform_key = self._normalize_key(platform, fallback="unknown")
+        user_key = self._normalize_key(user_id)
+        code = self._normalize_fund_code(fund_code)
+        action_text = str(action or "").strip().lower()
+        if not user_key:
+            raise ValueError("用户 ID 不能为空")
+        if not code:
+            raise ValueError("基金代码不能为空")
+        if not action_text:
+            raise ValueError("操作类型不能为空")
+
+        shares_delta_num = float(shares_delta)
+        shares_before_num = float(shares_before)
+        shares_after_num = float(shares_after)
+        avg_cost_num = float(avg_cost)
+        settlement_nav_num = None if settlement_nav is None else float(settlement_nav)
+        profit_amount_num = None if profit_amount is None else float(profit_amount)
+        settlement_nav_date_text = (
+            self._normalize_nav_date(settlement_nav_date) if settlement_nav_date else None
+        )
+        expected_settlement_date_text = (
+            self._normalize_nav_date(expected_settlement_date)
+            if expected_settlement_date
+            else None
+        )
+        settlement_rule_text = str(settlement_rule or "").strip()
+        note_text = str(note or "").strip()
+        fund_name_text = str(fund_name or "").strip()
+        now_ts = int(time.time())
+
+        with self._connect() as conn:
+            conn.execute("BEGIN")
+            fund = self._ensure_fund_tx(
+                conn=conn,
+                fund_code=code,
+                fund_name=fund_name_text,
+            )
+            cursor = conn.execute(
+                """
+                INSERT INTO user_fund_position_logs (
+                    platform,
+                    user_id,
+                    fund_id,
+                    action,
+                    shares_delta,
+                    shares_before,
+                    shares_after,
+                    avg_cost,
+                    settlement_nav,
+                    settlement_nav_date,
+                    expected_settlement_date,
+                    settlement_rule,
+                    profit_amount,
+                    note,
+                    created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    platform_key,
+                    user_key,
+                    int(fund["id"]),
+                    action_text,
+                    shares_delta_num,
+                    shares_before_num,
+                    shares_after_num,
+                    avg_cost_num,
+                    settlement_nav_num,
+                    settlement_nav_date_text,
+                    expected_settlement_date_text,
+                    settlement_rule_text,
+                    profit_amount_num,
+                    note_text,
+                    now_ts,
+                ),
+            )
+            return int(cursor.lastrowid or 0)
+
+    def list_position_logs(
+        self,
+        platform: Any,
+        user_id: Any,
+        limit: int = 50,
+        actions: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        platform_key = self._normalize_key(platform, fallback="unknown")
+        user_key = self._normalize_key(user_id)
+        if not user_key:
+            return []
+
+        query_limit = max(1, min(int(limit or 50), 500))
+        action_texts = [str(item or "").strip().lower() for item in (actions or [])]
+        action_texts = [item for item in action_texts if item]
+
+        sql = """
+            SELECT
+                l.id,
+                l.platform,
+                l.user_id,
+                l.fund_id,
+                f.fund_code,
+                f.fund_name,
+                l.action,
+                l.shares_delta,
+                l.shares_before,
+                l.shares_after,
+                l.avg_cost,
+                l.settlement_nav,
+                l.settlement_nav_date,
+                l.expected_settlement_date,
+                l.settlement_rule,
+                l.profit_amount,
+                l.note,
+                l.created_at
+            FROM user_fund_position_logs l
+            JOIN funds f ON f.id = l.fund_id
+            WHERE l.platform = ? AND l.user_id = ?
+        """
+        params: list[Any] = [platform_key, user_key]
+
+        if action_texts:
+            placeholders = ",".join("?" for _ in action_texts)
+            sql += f" AND l.action IN ({placeholders})"
+            params.extend(action_texts)
+
+        sql += " ORDER BY l.created_at DESC, l.id DESC LIMIT ?"
+        params.append(query_limit)
+
+        with self._connect() as conn:
+            rows = conn.execute(sql, tuple(params)).fetchall()
+        return [self._row_to_position_log(row) for row in rows]
 
     def delete_position(self, platform: Any, user_id: Any, fund_code: Any) -> bool:
         platform_key = self._normalize_key(platform, fallback="unknown")
@@ -628,3 +1103,50 @@ class DataHandler:
         with self._connect() as conn:
             rows = conn.execute(sql, tuple(params)).fetchall()
         return [self._row_to_nav(row) for row in rows]
+
+    def get_nav_on_or_after(
+        self,
+        fund_code: Any,
+        start_date: Any,
+        end_date: Any = None,
+    ) -> dict[str, Any] | None:
+        code = self._normalize_fund_code(fund_code)
+        if not code:
+            return None
+
+        start_date_text = self._normalize_nav_date(start_date)
+        end_date_text = self._normalize_nav_date(end_date) if end_date else None
+
+        sql = """
+            SELECT
+                h.fund_id,
+                f.fund_code,
+                f.fund_name,
+                h.nav_date,
+                h.unit_nav,
+                h.accum_nav,
+                h.change_rate,
+                h.source,
+                h.created_at,
+                h.updated_at
+            FROM fund_nav_history h
+            JOIN funds f ON f.id = h.fund_id
+            WHERE f.fund_code = ? AND h.nav_date >= ?
+        """
+        params: list[Any] = [code, start_date_text]
+        if end_date_text:
+            sql += " AND h.nav_date <= ?"
+            params.append(end_date_text)
+        sql += " ORDER BY h.nav_date ASC LIMIT 1"
+
+        with self._connect() as conn:
+            row = conn.execute(sql, tuple(params)).fetchone()
+        if row is None:
+            return None
+        return self._row_to_nav(row)
+
+    def get_latest_nav_record(self, fund_code: Any) -> dict[str, Any] | None:
+        records = self.list_fund_nav_history(fund_code=fund_code, limit=1)
+        if not records:
+            return None
+        return records[0]
