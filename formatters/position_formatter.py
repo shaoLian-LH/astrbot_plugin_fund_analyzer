@@ -91,6 +91,71 @@ def format_position_overview(
     return "\n".join(lines)
 
 
+def format_position_realtime_snapshot(
+    positions: list[dict[str, Any]],
+    fund_infos: dict[str, Any],
+    close_change_map: dict[str, dict[str, Any]],
+    qdii_cache_hits: int = 0,
+) -> str:
+    if not positions:
+        return "📭 当前没有基金持仓记录"
+
+    lines = ["⚡ 实时持仓", "━━━━━━━━━━━━━━━━━"]
+    missing_realtime = 0
+    missing_close = 0
+
+    for index, position in enumerate(positions, start=1):
+        code = str(position.get("fund_code", "")).strip()
+        shares = float(position.get("shares", 0) or 0)
+        info = fund_infos.get(code)
+        close_info = close_change_map.get(code) or {}
+
+        name = (
+            info.name
+            if info and getattr(info, "name", "")
+            else str(position.get("fund_name") or "").strip() or "未知基金"
+        )
+
+        latest_price = float(getattr(info, "latest_price", 0) or 0) if info else 0.0
+        if latest_price > 0:
+            latest_price_text = f"{latest_price:.4f}"
+        else:
+            latest_price_text = "暂无"
+            missing_realtime += 1
+
+        close_date = str(close_info.get("close_date") or "").strip() or "--"
+        change_rate_raw = close_info.get("change_rate")
+        if change_rate_raw is None:
+            change_rate_text = "暂无"
+            missing_close += 1
+        else:
+            change_rate = float(change_rate_raw)
+            emoji = "🟢" if change_rate > 0 else "🔴" if change_rate < 0 else "⚪"
+            change_rate_text = f"{emoji} {change_rate:+.2f}%"
+
+        is_otc = bool(close_info.get("is_otc"))
+        is_qdii = bool(close_info.get("is_qdii"))
+        market_text = "场外" if is_otc else "场内"
+        if is_qdii:
+            market_text = f"{market_text}|QDII"
+
+        lines.append(f"{index}. {name} ({code}) [{market_text}]")
+        lines.append(f"   📦 份额: {shares:,.4f}")
+        lines.append(f"   💰 现价: {latest_price_text}")
+        lines.append(f"   📅 最近收盘: {close_date} | 涨跌幅: {change_rate_text}")
+        lines.append("━━━━━━━━━━━━━━━━━")
+
+    lines.append(f"⏰ 查询时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    if qdii_cache_hits > 0:
+        lines.append(f"♻️ QDII 净值复用: {qdii_cache_hits} 只（当日缓存）")
+    if missing_realtime > 0:
+        lines.append(f"⚠️ {missing_realtime} 只基金未获取到现价")
+    if missing_close > 0:
+        lines.append(f"⚠️ {missing_close} 只基金未获取到最近收盘涨跌幅")
+
+    return "\n".join(lines)
+
+
 def format_clear_position_result(result: dict[str, Any]) -> str:
     fund_name = str(result.get("fund_name") or "").strip() or "未知基金"
     fund_code = str(result.get("fund_code") or "").strip()

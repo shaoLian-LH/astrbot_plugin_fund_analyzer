@@ -372,6 +372,11 @@ class EastMoneyAPI:
         
         return False
 
+    def is_otc_fund_code(self, fund_code: str) -> bool:
+        """公开方法：判断基金代码是否为场外基金。"""
+        normalized_code = self._normalize_fund_code(fund_code)
+        return self._is_otc_fund(normalized_code)
+
     @staticmethod
     def _is_meaningful_realtime(data: Optional[dict]) -> bool:
         """判断实时数据是否包含可用信息（名称或价格）"""

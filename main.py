@@ -35,6 +35,7 @@ from .formatters.position_formatter import (
     format_nav_sync_result,
     format_position_add_result,
     format_position_repair_result,
+    format_position_realtime_snapshot,
     format_position_overview,
 )
 from .formatters.fund_formatter import (
@@ -258,6 +259,17 @@ class FundAnalyzer:
             logger.error(f"搜索基金失败: {e}")
             return []
 
+    def is_otc_fund_code(self, fund_code: str) -> bool:
+        """判断基金代码是否更偏向场外基金。"""
+        code = str(fund_code or "").strip()
+        if not code:
+            return False
+        try:
+            return bool(self._api.is_otc_fund_code(code))
+        except Exception as e:
+            logger.debug(f"判断基金场内/场外失败: {code}, {e}")
+            return False
+
     def calculate_technical_indicators(
         self, history_data: list[dict]
     ) -> dict[str, Any]:
@@ -320,7 +332,7 @@ NAV_SYNC_FETCH_BUFFER_DAYS = 5
     "astrbot_plugin_fund_analyzer",
     "2529huang",
     "基金数据分析插件 - 使用AKShare获取LOF/ETF基金数据",
-    "1.1.5",
+    "1.2.0",
 )
 class FundAnalyzerPlugin(Star):
     """基金分析插件主类"""
@@ -373,6 +385,11 @@ class FundAnalyzerPlugin(Star):
         self._data_dir.mkdir(parents=True, exist_ok=True)
         # 加载用户设置
         self.user_fund_settings: dict[str, str] = self._load_user_settings()
+        # QDII 识别缓存（跨命令复用）
+        self._qdii_flag_cache: dict[str, bool] = {}
+        # sscc 专用：QDII 最近收盘净值缓存（按自然日复用）
+        self._sscc_qdii_close_cache: dict[str, dict[str, Any] | None] = {}
+        self._sscc_qdii_close_cache_day = date.today().isoformat()
         # 检查依赖
         self._check_dependencies()
         self._ensure_nav_sync_task()
@@ -498,6 +515,14 @@ class FundAnalyzerPlugin(Star):
 
     async def _resolve_is_qdii(self, fund_code: str, fund_name: str) -> bool:
         code = str(fund_code or "").strip()
+        if self._is_qdii_fund(fund_name):
+            if code:
+                self._qdii_flag_cache[code] = True
+            return True
+
+        if code in self._qdii_flag_cache:
+            return bool(self._qdii_flag_cache.get(code))
+
         if code:
             try:
                 search_results = await self.analyzer.search_fund(
@@ -510,10 +535,12 @@ class FundAnalyzerPlugin(Star):
                         continue
                     fund_type = str(item.get("fund_type") or "").strip()
                     if fund_type:
-                        return self._is_qdii_by_fund_type(fund_type)
+                        is_qdii = self._is_qdii_by_fund_type(fund_type)
+                        self._qdii_flag_cache[code] = is_qdii
+                        return is_qdii
             except Exception as e:
                 logger.debug(f"通过 API 判断 QDII 失败，回退名称判断: {code}, {e}")
-        return self._is_qdii_fund(fund_name)
+        return False
 
     @staticmethod
     def _calc_expected_settlement_date(
@@ -587,6 +614,241 @@ class FundAnalyzerPlugin(Star):
         )
 
     @staticmethod
+    def _safe_float(value: Any, default: float = 0.0) -> float:
+        if value is None or value == "":
+            return default
+        try:
+            result = float(value)
+        except (TypeError, ValueError):
+            return default
+        if result != result:
+            return default
+        return result
+
+    def _is_otc_fund_code(self, fund_code: str) -> bool:
+        code = self._normalize_ssgz_fund_code(fund_code)
+        if not code:
+            return False
+
+        try:
+            if self.analyzer.is_otc_fund_code(code):
+                return True
+        except Exception as e:
+            logger.debug(f"判断基金场内/场外失败: {code}, {e}")
+
+        if code.startswith(("1", "5")):
+            return False
+        return code.startswith(("0", "2"))
+
+    def _build_fund_info_from_valuation(
+        self,
+        fund_code: str,
+        valuation: dict[str, Any],
+    ) -> FundInfo:
+        estimate_value = self._safe_float(valuation.get("estimate_value"))
+        latest_price = self._safe_float(valuation.get("latest_price"))
+        unit_value = self._safe_float(valuation.get("unit_value"))
+        prev_close = self._safe_float(valuation.get("prev_close"))
+
+        current_price = estimate_value if estimate_value > 0 else latest_price
+        if current_price <= 0 and unit_value > 0:
+            current_price = unit_value
+        if current_price <= 0 and prev_close > 0:
+            current_price = prev_close
+
+        change_amount = self._safe_float(valuation.get("change_amount"))
+        change_rate = self._safe_float(valuation.get("change_rate"))
+        if change_amount == 0 and current_price > 0 and prev_close > 0:
+            change_amount = current_price - prev_close
+        if change_rate == 0 and prev_close > 0 and change_amount != 0:
+            change_rate = change_amount / prev_close * 100
+
+        return FundInfo(
+            code=str(valuation.get("code") or fund_code).strip() or fund_code,
+            name=str(valuation.get("name") or "").strip(),
+            latest_price=current_price,
+            change_amount=change_amount,
+            change_rate=change_rate,
+            open_price=0.0,
+            high_price=0.0,
+            low_price=0.0,
+            prev_close=prev_close if prev_close > 0 else unit_value,
+            volume=0.0,
+            amount=0.0,
+            turnover_rate=0.0,
+        )
+
+    async def _batch_fetch_position_realtime_infos(
+        self,
+        fund_codes: list[str],
+        max_concurrency: int = 6,
+    ) -> dict[str, FundInfo]:
+        unique_codes: list[str] = []
+        seen = set()
+        for code in fund_codes:
+            normalized = self._normalize_ssgz_fund_code(code)
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            unique_codes.append(normalized)
+
+        if not unique_codes:
+            return {}
+
+        otc_codes = [code for code in unique_codes if self._is_otc_fund_code(code)]
+        fund_infos: dict[str, FundInfo] = {}
+
+        if otc_codes:
+            valuation_map = await self.analyzer.get_realtime_valuation_batch(
+                otc_codes,
+                max_concurrency=max_concurrency,
+            )
+            for code in otc_codes:
+                valuation = valuation_map.get(code)
+                if valuation:
+                    fund_infos[code] = self._build_fund_info_from_valuation(
+                        code,
+                        valuation,
+                    )
+
+        unresolved_codes = [code for code in unique_codes if code not in fund_infos]
+        if unresolved_codes:
+            fallback_infos = await self._batch_fetch_fund_infos(
+                unresolved_codes,
+                max_concurrency=max_concurrency,
+            )
+            fund_infos.update(fallback_infos)
+
+        return fund_infos
+
+    @staticmethod
+    def _extract_latest_close_change(
+        history_data: list[dict[str, Any]] | None,
+    ) -> dict[str, Any] | None:
+        if not history_data:
+            return None
+
+        latest = history_data[-1] or {}
+        close_date = str(latest.get("date") or "").strip()
+
+        raw_change_rate = latest.get("change_rate")
+        change_rate: float | None = None
+        if raw_change_rate not in (None, "", "--"):
+            try:
+                parsed = float(raw_change_rate)
+                if parsed == parsed:
+                    change_rate = parsed
+            except (TypeError, ValueError):
+                change_rate = None
+
+        return {
+            "close_date": close_date or "--",
+            "change_rate": change_rate,
+        }
+
+    def _rollover_sscc_qdii_close_cache(self) -> None:
+        today = date.today().isoformat()
+        if self._sscc_qdii_close_cache_day != today:
+            self._sscc_qdii_close_cache_day = today
+            self._sscc_qdii_close_cache.clear()
+
+    def _get_cached_sscc_qdii_close_change(
+        self, fund_code: str
+    ) -> tuple[dict[str, Any] | None, bool]:
+        self._rollover_sscc_qdii_close_cache()
+        if fund_code not in self._sscc_qdii_close_cache:
+            return None, False
+        cached = self._sscc_qdii_close_cache.get(fund_code)
+        if cached is None:
+            return None, True
+        return dict(cached), True
+
+    def _save_cached_sscc_qdii_close_change(
+        self,
+        fund_code: str,
+        close_change: dict[str, Any] | None,
+    ) -> None:
+        self._rollover_sscc_qdii_close_cache()
+        self._sscc_qdii_close_cache[fund_code] = dict(close_change) if close_change else None
+
+    async def _batch_fetch_position_close_changes(
+        self,
+        positions: list[dict[str, Any]],
+        fund_infos: dict[str, FundInfo],
+        max_concurrency: int = 4,
+    ) -> tuple[dict[str, dict[str, Any]], int]:
+        unique_codes: list[str] = []
+        seen = set()
+        name_map: dict[str, str] = {}
+        for item in positions:
+            code = self._normalize_ssgz_fund_code(item.get("fund_code"))
+            if not code:
+                continue
+            if code not in seen:
+                seen.add(code)
+                unique_codes.append(code)
+            local_name = str(item.get("fund_name") or "").strip()
+            if local_name and code not in name_map:
+                name_map[code] = local_name
+
+        if not unique_codes:
+            return {}, 0
+
+        semaphore = asyncio.Semaphore(max(1, min(max_concurrency, 12)))
+
+        async def fetch_one(code: str) -> tuple[str, dict[str, Any], bool]:
+            is_otc = self._is_otc_fund_code(code)
+            is_qdii = False
+            close_change: dict[str, Any] | None = None
+            cache_hit = False
+
+            async with semaphore:
+                try:
+                    info = fund_infos.get(code)
+                    fund_name = (
+                        info.name
+                        if info and getattr(info, "name", "")
+                        else name_map.get(code, "")
+                    )
+                    is_qdii = await self._resolve_is_qdii(code, fund_name)
+
+                    if is_qdii:
+                        cached, cache_hit = self._get_cached_sscc_qdii_close_change(code)
+                        if cache_hit:
+                            close_change = cached
+
+                    if close_change is None and not cache_hit:
+                        history = await self.analyzer.get_lof_history(code, days=5)
+                        close_change = self._extract_latest_close_change(history)
+                        if is_qdii:
+                            self._save_cached_sscc_qdii_close_change(code, close_change)
+                except Exception as e:
+                    logger.debug(f"获取基金最近收盘涨跌幅失败: {code}, {e}")
+                    if is_qdii:
+                        self._save_cached_sscc_qdii_close_change(code, None)
+                    close_change = None
+
+            payload = dict(close_change or {"close_date": "--", "change_rate": None})
+            payload["is_otc"] = is_otc
+            payload["is_qdii"] = is_qdii
+            return code, payload, cache_hit
+
+        tasks = [asyncio.create_task(fetch_one(code)) for code in unique_codes]
+        raw_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        close_change_map: dict[str, dict[str, Any]] = {}
+        qdii_cache_hits = 0
+        for item in raw_results:
+            if isinstance(item, Exception):
+                continue
+            code, payload, cache_hit = item
+            close_change_map[code] = payload
+            if cache_hit:
+                qdii_cache_hits += 1
+
+        return close_change_map, qdii_cache_hits
+
+    @staticmethod
     def _format_position_add_result(
         saved_records: list[dict[str, Any]],
         fund_infos: dict[str, FundInfo],
@@ -599,6 +861,20 @@ class FundAnalyzerPlugin(Star):
         fund_infos: dict[str, FundInfo],
     ) -> str:
         return format_position_overview(positions, fund_infos)
+
+    @staticmethod
+    def _format_position_realtime_snapshot(
+        positions: list[dict[str, Any]],
+        fund_infos: dict[str, FundInfo],
+        close_change_map: dict[str, dict[str, Any]],
+        qdii_cache_hits: int = 0,
+    ) -> str:
+        return format_position_realtime_snapshot(
+            positions=positions,
+            fund_infos=fund_infos,
+            close_change_map=close_change_map,
+            qdii_cache_hits=qdii_cache_hits,
+        )
 
     @staticmethod
     def _format_position_repair_result(stats: dict[str, Any]) -> str:
@@ -1418,6 +1694,61 @@ class FundAnalyzerPlugin(Star):
             logger.error(f"清仓基金失败: {e}")
             yield event.plain_result(f"❌ 清仓失败: {str(e)}")
 
+    @filter.command("sscc")
+    async def snapshot_position_realtime(self, event: AstrMessageEvent):
+        """
+        实时查看当前用户持仓基金现价与最近收盘日涨跌幅。
+        用法: sscc
+        """
+        try:
+            self._ensure_nav_sync_task()
+            platform, user_id = self._resolve_position_owner(event)
+            if not user_id:
+                yield event.plain_result("❌ 无法识别当前用户 ID，请稍后再试")
+                return
+
+            positions = self.data_handler.list_positions(platform=platform, user_id=user_id)
+            if not positions:
+                yield event.plain_result(
+                    "📭 当前没有基金持仓记录\n"
+                    "💡 用法: 增加基金持仓 {基金代码,平均成本,持有份额}\n"
+                    "💡 示例: 增加基金持仓 {161226,1.0234,1200}"
+                )
+                return
+
+            fund_codes: list[str] = []
+            seen = set()
+            for item in positions:
+                code = self._normalize_ssgz_fund_code(item.get("fund_code"))
+                if not code or code in seen:
+                    continue
+                seen.add(code)
+                fund_codes.append(code)
+
+            yield event.plain_result("⚡ 正在查询你持仓基金的现价与最近收盘涨跌幅...")
+
+            fund_infos = await self._batch_fetch_position_realtime_infos(
+                fund_codes,
+                max_concurrency=6,
+            )
+            close_change_map, qdii_cache_hits = await self._batch_fetch_position_close_changes(
+                positions=positions,
+                fund_infos=fund_infos,
+                max_concurrency=4,
+            )
+
+            yield event.plain_result(
+                self._format_position_realtime_snapshot(
+                    positions=positions,
+                    fund_infos=fund_infos,
+                    close_change_map=close_change_map,
+                    qdii_cache_hits=qdii_cache_hits,
+                )
+            )
+        except Exception as e:
+            logger.error(f"sscc 实时持仓查询失败: {e}")
+            yield event.plain_result(f"❌ 实时持仓查询失败: {str(e)}")
+
     @filter.command("ckcc")
     async def check_fund_positions(self, event: AstrMessageEvent):
         """
@@ -2036,6 +2367,7 @@ class FundAnalyzerPlugin(Star):
 🔹 设置基金 代码 - 设置默认基金
 🔹 增加基金持仓 {代码,成本,份额} - 记录个人持仓（支持批量）
 🔹 清仓基金 [基金代码] [份额|百分比] - 卖出基金份额（默认全仓）
+🔹 sscc - 查看当前持仓基金现价与最近收盘涨跌幅
 🔹 ckcc - 查看当前持仓与收益
 🔹 修复基金持仓数据 - 修复当前用户的持仓相关基金数据
 🔹 ckqcjl [条数] - 查看清仓/卖出历史记录
@@ -2059,6 +2391,7 @@ class FundAnalyzerPlugin(Star):
   • 搜索基金 白银
   • 增加基金持仓 {161226,1.0234,1200} {001632,2.1456,500}
   • 清仓基金 161226 25%
+  • sscc
   • ckqcjl 20
   • ckcc
   • 修复基金持仓数据
