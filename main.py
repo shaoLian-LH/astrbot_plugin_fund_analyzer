@@ -338,7 +338,7 @@ NAV_SYNC_INTRADAY_END = "14:55"
     "astrbot_plugin_fund_analyzer",
     "2529huang",
     "基金数据分析插件 - 使用AKShare获取LOF/ETF基金数据",
-    "1.4.0",
+    "1.4.1",
 )
 class FundAnalyzerPlugin(Star):
     """基金分析插件主类"""

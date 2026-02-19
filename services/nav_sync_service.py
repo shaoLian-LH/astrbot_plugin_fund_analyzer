@@ -155,10 +155,29 @@ class NavSyncService:
                 if response.status != 200:
                     raise RuntimeError(f"holiday API HTTP {response.status}")
                 payload = await response.json(content_type=None)
-                if not isinstance(payload, dict):
-                    raise RuntimeError("holiday API 响应不是 JSON 对象")
 
-        status = payload.get("status")
+        if isinstance(payload, dict):
+            payload_data = payload
+        elif isinstance(payload, list):
+            if not payload:
+                raise RuntimeError("holiday API 响应数组为空")
+            # 兼容接口返回数组：优先取与请求日期匹配的对象，找不到则取首个对象。
+            payload_data = next(
+                (
+                    item
+                    for item in payload
+                    if isinstance(item, dict) and str(item.get("date", "")).strip() == date_text
+                ),
+                None,
+            )
+            if payload_data is None:
+                payload_data = next((item for item in payload if isinstance(item, dict)), None)
+            if payload_data is None:
+                raise RuntimeError("holiday API 响应数组中缺少有效对象")
+        else:
+            raise RuntimeError("holiday API 响应不是 JSON 对象或数组")
+
+        status = payload_data.get("status")
         try:
             status_int = int(status)
         except (TypeError, ValueError) as e:
