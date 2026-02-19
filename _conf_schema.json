@@ -1,0 +1,65 @@
+{
+  "nav_sync_interval_seconds": {
+    "description": "交易时段内自动同步净值的间隔秒数。",
+    "type": "int",
+    "hint": "默认 180（3分钟）。建议不小于 60。",
+    "obvious_hint": true,
+    "default": 180
+  },
+  "nav_sync_intraday_start": {
+    "description": "交易日盘中自动同步开始时间（HH:MM）。",
+    "type": "string",
+    "hint": "默认 09:40，按配置时区解析。",
+    "obvious_hint": true,
+    "default": "09:40"
+  },
+  "nav_sync_intraday_end": {
+    "description": "交易日盘中自动同步结束时间（HH:MM，包含该时刻）。",
+    "type": "string",
+    "hint": "默认 14:55，按配置时区解析。",
+    "obvious_hint": true,
+    "default": "14:55"
+  },
+  "nav_sync_timezone": {
+    "description": "自动同步任务使用的时区。",
+    "type": "string",
+    "hint": "默认 Asia/Shanghai。",
+    "default": "Asia/Shanghai"
+  },
+  "nav_sync_holiday_api_url": {
+    "description": "节假日判定接口地址。",
+    "type": "string",
+    "hint": "默认 http://api.haoshenqi.top/holiday。",
+    "default": "http://api.haoshenqi.top/holiday"
+  },
+  "nav_sync_holiday_max_retries": {
+    "description": "节假日接口失败时的最大重试次数。",
+    "type": "int",
+    "hint": "默认 3，重试后仍失败会降级为本地工作日规则。",
+    "default": 3
+  },
+  "nav_sync_holiday_timeout_seconds": {
+    "description": "节假日接口请求超时时间（秒）。",
+    "type": "int",
+    "hint": "默认 8。",
+    "default": 8
+  },
+  "nav_sync_default_fetch_days": {
+    "description": "首次或全量同步时的默认历史拉取天数。",
+    "type": "int",
+    "hint": "默认 120。",
+    "default": 120
+  },
+  "nav_sync_max_fetch_days": {
+    "description": "增量补齐场景允许的最大历史拉取天数。",
+    "type": "int",
+    "hint": "默认 365。",
+    "default": 365
+  },
+  "nav_sync_fetch_buffer_days": {
+    "description": "增量同步额外追加的缓冲天数。",
+    "type": "int",
+    "hint": "默认 5。",
+    "default": 5
+  }
+}

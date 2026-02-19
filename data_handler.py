@@ -1,4 +1,5 @@
 import os
+import re
 import sqlite3
 import time
 from datetime import date, datetime
@@ -11,10 +12,15 @@ DEFAULT_DATA_PATH = DEFAULT_DB_PATH
 class DataHandler:
     """基金数据持久化处理器（基金主数据、用户持仓、历史净值）。"""
 
-    SCHEMA_VERSION = "3"
+    SCHEMA_VERSION = "4"
+    LEGACY_NAV_TABLE = "fund_nav_history"
+    NAV_PARTITION_SUFFIX = "fund_nav_history"
+    NAV_PARTITION_TABLE_PATTERN = re.compile(r"^\d{4}_\d{2}_fund_nav_history$")
+    NAV_PARTITION_TABLE_GLOB = "[0-9][0-9][0-9][0-9]_[0-9][0-9]_fund_nav_history"
 
     def __init__(self, path: str = DEFAULT_DB_PATH):
         self.path = path
+        self._nav_partition_table_cache: list[str] | None = None
         self._ensure_parent_dir()
         self._init_db()
 
@@ -106,10 +112,17 @@ class DataHandler:
                 );
                 """
             )
-            conn.execute(
-                "INSERT OR REPLACE INTO schema_meta(key, value) VALUES('schema_version', ?)",
-                (self.SCHEMA_VERSION,),
+            stored_version = self._get_schema_meta_value_tx(
+                conn=conn,
+                key="schema_version",
+                default="0",
             )
+            if stored_version != self.SCHEMA_VERSION:
+                self._set_schema_meta_value_tx(
+                    conn=conn,
+                    key="schema_version",
+                    value=self.SCHEMA_VERSION,
+                )
 
     @staticmethod
     def _normalize_key(value: Any, fallback: str = "") -> str:
@@ -157,6 +170,164 @@ class DataHandler:
         except ValueError as e:
             raise ValueError(f"净值日期格式错误: {nav_date}") from e
         return text
+
+    @staticmethod
+    def _quote_identifier(identifier: str) -> str:
+        text = str(identifier or "")
+        return '"' + text.replace('"', '""') + '"'
+
+    @classmethod
+    def _is_nav_partition_table_name(cls, table_name: str) -> bool:
+        return bool(cls.NAV_PARTITION_TABLE_PATTERN.match(str(table_name or "").strip()))
+
+    @classmethod
+    def _build_nav_partition_table_name(cls, nav_date_text: str) -> str:
+        nav_day = datetime.strptime(nav_date_text, "%Y-%m-%d").date()
+        return f"{nav_day.year:04d}_{nav_day.month:02d}_{cls.NAV_PARTITION_SUFFIX}"
+
+    @classmethod
+    def _extract_month_key_from_table_name(cls, table_name: str) -> int | None:
+        if not cls._is_nav_partition_table_name(table_name):
+            return None
+        year_text = table_name[0:4]
+        month_text = table_name[5:7]
+        try:
+            year_num = int(year_text)
+            month_num = int(month_text)
+        except ValueError:
+            return None
+        if month_num < 1 or month_num > 12:
+            return None
+        return year_num * 100 + month_num
+
+    @staticmethod
+    def _extract_month_key_from_date_text(nav_date_text: str) -> int:
+        nav_day = datetime.strptime(nav_date_text, "%Y-%m-%d").date()
+        return nav_day.year * 100 + nav_day.month
+
+    def _set_schema_meta_value_tx(
+        self,
+        conn: sqlite3.Connection,
+        key: str,
+        value: str,
+    ) -> None:
+        conn.execute(
+            "INSERT OR REPLACE INTO schema_meta(key, value) VALUES(?, ?)",
+            (str(key), str(value)),
+        )
+
+    def _get_schema_meta_value_tx(
+        self,
+        conn: sqlite3.Connection,
+        key: str,
+        default: str = "",
+    ) -> str:
+        row = conn.execute(
+            "SELECT value FROM schema_meta WHERE key = ?",
+            (str(key),),
+        ).fetchone()
+        if row is None:
+            return default
+        return str(row["value"] or default)
+
+    def _list_nav_partition_tables_tx(
+        self,
+        conn: sqlite3.Connection,
+        refresh: bool = False,
+    ) -> list[str]:
+        if self._nav_partition_table_cache is not None and not refresh:
+            return list(self._nav_partition_table_cache)
+
+        rows = conn.execute(
+            """
+            SELECT name
+            FROM sqlite_master
+            WHERE type = 'table'
+              AND name GLOB ?
+            ORDER BY name DESC
+            """,
+            (self.NAV_PARTITION_TABLE_GLOB,),
+        ).fetchall()
+        tables = [
+            str(row["name"])
+            for row in rows
+            if self._is_nav_partition_table_name(str(row["name"]))
+        ]
+        self._nav_partition_table_cache = list(tables)
+        return list(tables)
+
+    def _ensure_nav_partition_table_tx(
+        self,
+        conn: sqlite3.Connection,
+        table_name: str,
+    ) -> None:
+        if not self._is_nav_partition_table_name(table_name):
+            raise ValueError(f"净值分表名称非法: {table_name}")
+
+        quoted_table = self._quote_identifier(table_name)
+        conn.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {quoted_table} (
+                fund_id INTEGER NOT NULL,
+                nav_date TEXT NOT NULL,
+                unit_nav REAL NOT NULL,
+                accum_nav REAL,
+                change_rate REAL,
+                source TEXT NOT NULL DEFAULT '',
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY (fund_id, nav_date),
+                FOREIGN KEY (fund_id) REFERENCES funds(id) ON DELETE CASCADE
+            )
+            """
+        )
+
+        index_name = f"idx_{table_name}_fund_date"
+        conn.execute(
+            f"""
+            CREATE INDEX IF NOT EXISTS {self._quote_identifier(index_name)}
+            ON {quoted_table}(fund_id, nav_date DESC)
+            """
+        )
+        self._nav_partition_table_cache = None
+
+    def _resolve_nav_tables_tx(
+        self,
+        conn: sqlite3.Connection,
+        start_date: str | None = None,
+        end_date: str | None = None,
+        include_legacy: bool = True,
+        order_desc: bool = True,
+    ) -> list[str]:
+        tables = self._list_nav_partition_tables_tx(conn=conn)
+
+        start_key = (
+            self._extract_month_key_from_date_text(start_date)
+            if start_date
+            else None
+        )
+        end_key = (
+            self._extract_month_key_from_date_text(end_date)
+            if end_date
+            else None
+        )
+        if start_key is not None or end_key is not None:
+            filtered: list[str] = []
+            for table_name in tables:
+                table_key = self._extract_month_key_from_table_name(table_name)
+                if table_key is None:
+                    continue
+                if start_key is not None and table_key < start_key:
+                    continue
+                if end_key is not None and table_key > end_key:
+                    continue
+                filtered.append(table_name)
+            tables = filtered
+
+        tables = sorted(tables, reverse=order_desc)
+        if include_legacy:
+            tables.append(self.LEGACY_NAV_TABLE)
+        return tables
 
     def _row_to_fund(self, row: sqlite3.Row) -> dict[str, Any]:
         return {
@@ -320,20 +491,35 @@ class DataHandler:
             return None
 
         with self._connect() as conn:
-            row = conn.execute(
-                """
-                SELECT h.nav_date
-                FROM fund_nav_history h
-                JOIN funds f ON f.id = h.fund_id
-                WHERE f.fund_code = ?
-                ORDER BY h.nav_date DESC
-                LIMIT 1
-                """,
-                (code,),
-            ).fetchone()
-        if row is None:
-            return None
-        return str(row["nav_date"])
+            fund_row = self._get_fund_by_code_tx(conn=conn, fund_code=code)
+            if fund_row is None:
+                return None
+
+            fund_id = int(fund_row["id"])
+            nav_tables = self._resolve_nav_tables_tx(
+                conn=conn,
+                include_legacy=True,
+                order_desc=True,
+            )
+            latest_date: str | None = None
+            for table_name in nav_tables:
+                quoted_table = self._quote_identifier(table_name)
+                row = conn.execute(
+                    f"""
+                    SELECT nav_date
+                    FROM {quoted_table}
+                    WHERE fund_id = ?
+                    ORDER BY nav_date DESC
+                    LIMIT 1
+                    """,
+                    (fund_id,),
+                ).fetchone()
+                if row is None:
+                    continue
+                nav_date = str(row["nav_date"])
+                if latest_date is None or nav_date > latest_date:
+                    latest_date = nav_date
+        return latest_date
 
     def _get_position_tx(
         self,
@@ -1196,6 +1382,37 @@ class DataHandler:
         source_text = str(source or "").strip()
         now_ts = int(time.time())
         affected = 0
+        prepared: dict[str, list[tuple[Any, ...]]] = {}
+
+        for record in nav_records:
+            nav_date = self._normalize_nav_date(
+                record.get("nav_date", record.get("date"))
+            )
+            unit_nav = self._as_positive_float(record.get("unit_nav"), "单位净值")
+            accum_nav_raw = record.get("accum_nav")
+            accum_nav = (
+                None
+                if accum_nav_raw in (None, "", "--")
+                else self._safe_float(accum_nav_raw, default=0.0)
+            )
+            change_rate_raw = record.get("change_rate")
+            change_rate = (
+                None
+                if change_rate_raw in (None, "", "--")
+                else self._safe_float(change_rate_raw, default=0.0)
+            )
+            table_name = self._build_nav_partition_table_name(nav_date)
+            prepared.setdefault(table_name, []).append(
+                (
+                    nav_date,
+                    unit_nav,
+                    accum_nav,
+                    change_rate,
+                    source_text,
+                    now_ts,
+                    now_ts,
+                )
+            )
 
         with self._connect() as conn:
             conn.execute("BEGIN")
@@ -1206,52 +1423,44 @@ class DataHandler:
             )
             fund_id = int(fund["id"])
 
-            for record in nav_records:
-                nav_date = self._normalize_nav_date(
-                    record.get("nav_date", record.get("date"))
-                )
-                unit_nav = self._as_positive_float(record.get("unit_nav"), "单位净值")
-
-                accum_nav_raw = record.get("accum_nav")
-                accum_nav = (
-                    None
-                    if accum_nav_raw in (None, "", "--")
-                    else self._safe_float(accum_nav_raw, default=0.0)
-                )
-                change_rate_raw = record.get("change_rate")
-                change_rate = (
-                    None
-                    if change_rate_raw in (None, "", "--")
-                    else self._safe_float(change_rate_raw, default=0.0)
-                )
-
-                conn.execute(
-                    """
-                    INSERT INTO fund_nav_history (
-                        fund_id, nav_date, unit_nav, accum_nav, change_rate, source, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(fund_id, nav_date) DO UPDATE SET
-                        unit_nav = excluded.unit_nav,
-                        accum_nav = excluded.accum_nav,
-                        change_rate = excluded.change_rate,
-                        source = CASE
-                            WHEN excluded.source != '' THEN excluded.source
-                            ELSE fund_nav_history.source
-                        END,
-                        updated_at = excluded.updated_at
-                    """,
-                    (
-                        fund_id,
-                        nav_date,
-                        unit_nav,
-                        accum_nav,
-                        change_rate,
-                        source_text,
-                        now_ts,
-                        now_ts,
-                    ),
-                )
-                affected += 1
+            for table_name, rows in prepared.items():
+                self._ensure_nav_partition_table_tx(conn=conn, table_name=table_name)
+                quoted_table = self._quote_identifier(table_name)
+                for row_data in rows:
+                    conn.execute(
+                        f"""
+                        INSERT INTO {quoted_table} (
+                            fund_id,
+                            nav_date,
+                            unit_nav,
+                            accum_nav,
+                            change_rate,
+                            source,
+                            created_at,
+                            updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(fund_id, nav_date) DO UPDATE SET
+                            unit_nav = excluded.unit_nav,
+                            accum_nav = excluded.accum_nav,
+                            change_rate = excluded.change_rate,
+                            source = CASE
+                                WHEN excluded.source != '' THEN excluded.source
+                                ELSE {quoted_table}.source
+                            END,
+                            updated_at = excluded.updated_at
+                        """,
+                        (
+                            fund_id,
+                            row_data[0],
+                            row_data[1],
+                            row_data[2],
+                            row_data[3],
+                            row_data[4],
+                            row_data[5],
+                            row_data[6],
+                        ),
+                    )
+                    affected += 1
 
         return affected
 
@@ -1270,37 +1479,63 @@ class DataHandler:
         date_to = self._normalize_nav_date(end_date) if end_date else None
         query_limit = max(1, min(int(limit or 120), 2000))
 
-        sql = """
-            SELECT
-                h.fund_id,
-                f.fund_code,
-                f.fund_name,
-                h.nav_date,
-                h.unit_nav,
-                h.accum_nav,
-                h.change_rate,
-                h.source,
-                h.created_at,
-                h.updated_at
-            FROM fund_nav_history h
-            JOIN funds f ON f.id = h.fund_id
-            WHERE f.fund_code = ?
-        """
-        params: list[Any] = [code]
-
-        if date_from:
-            sql += " AND h.nav_date >= ?"
-            params.append(date_from)
-        if date_to:
-            sql += " AND h.nav_date <= ?"
-            params.append(date_to)
-
-        sql += " ORDER BY h.nav_date DESC LIMIT ?"
-        params.append(query_limit)
-
         with self._connect() as conn:
-            rows = conn.execute(sql, tuple(params)).fetchall()
-        return [self._row_to_nav(row) for row in rows]
+            nav_tables = self._resolve_nav_tables_tx(
+                conn=conn,
+                start_date=date_from,
+                end_date=date_to,
+                include_legacy=True,
+                order_desc=True,
+            )
+            merged_rows: list[sqlite3.Row] = []
+            seen_dates: set[str] = set()
+
+            for table_name in nav_tables:
+                quoted_table = self._quote_identifier(table_name)
+                sql = f"""
+                    SELECT
+                        h.fund_id,
+                        f.fund_code,
+                        f.fund_name,
+                        h.nav_date,
+                        h.unit_nav,
+                        h.accum_nav,
+                        h.change_rate,
+                        h.source,
+                        h.created_at,
+                        h.updated_at
+                    FROM {quoted_table} h
+                    JOIN funds f ON f.id = h.fund_id
+                    WHERE f.fund_code = ?
+                """
+                params: list[Any] = [code]
+
+                if date_from:
+                    sql += " AND h.nav_date >= ?"
+                    params.append(date_from)
+                if date_to:
+                    sql += " AND h.nav_date <= ?"
+                    params.append(date_to)
+                sql += " ORDER BY h.nav_date DESC LIMIT ?"
+                params.append(query_limit)
+
+                rows = conn.execute(sql, tuple(params)).fetchall()
+                for row in rows:
+                    nav_date_key = str(row["nav_date"])
+                    if nav_date_key in seen_dates:
+                        continue
+                    seen_dates.add(nav_date_key)
+                    merged_rows.append(row)
+
+        sorted_rows = sorted(
+            merged_rows,
+            key=lambda row: (
+                str(row["nav_date"]),
+                int(row["updated_at"]),
+            ),
+            reverse=True,
+        )
+        return [self._row_to_nav(row) for row in sorted_rows[:query_limit]]
 
     def get_nav_on_or_after(
         self,
@@ -1315,33 +1550,48 @@ class DataHandler:
         start_date_text = self._normalize_nav_date(start_date)
         end_date_text = self._normalize_nav_date(end_date) if end_date else None
 
-        sql = """
-            SELECT
-                h.fund_id,
-                f.fund_code,
-                f.fund_name,
-                h.nav_date,
-                h.unit_nav,
-                h.accum_nav,
-                h.change_rate,
-                h.source,
-                h.created_at,
-                h.updated_at
-            FROM fund_nav_history h
-            JOIN funds f ON f.id = h.fund_id
-            WHERE f.fund_code = ? AND h.nav_date >= ?
-        """
-        params: list[Any] = [code, start_date_text]
-        if end_date_text:
-            sql += " AND h.nav_date <= ?"
-            params.append(end_date_text)
-        sql += " ORDER BY h.nav_date ASC LIMIT 1"
-
         with self._connect() as conn:
-            row = conn.execute(sql, tuple(params)).fetchone()
-        if row is None:
+            nav_tables = self._resolve_nav_tables_tx(
+                conn=conn,
+                start_date=start_date_text,
+                end_date=end_date_text,
+                include_legacy=True,
+                order_desc=False,
+            )
+            best_row: sqlite3.Row | None = None
+            for table_name in nav_tables:
+                quoted_table = self._quote_identifier(table_name)
+                sql = f"""
+                    SELECT
+                        h.fund_id,
+                        f.fund_code,
+                        f.fund_name,
+                        h.nav_date,
+                        h.unit_nav,
+                        h.accum_nav,
+                        h.change_rate,
+                        h.source,
+                        h.created_at,
+                        h.updated_at
+                    FROM {quoted_table} h
+                    JOIN funds f ON f.id = h.fund_id
+                    WHERE f.fund_code = ? AND h.nav_date >= ?
+                """
+                params: list[Any] = [code, start_date_text]
+                if end_date_text:
+                    sql += " AND h.nav_date <= ?"
+                    params.append(end_date_text)
+                sql += " ORDER BY h.nav_date ASC LIMIT 1"
+
+                row = conn.execute(sql, tuple(params)).fetchone()
+                if row is None:
+                    continue
+                if best_row is None or str(row["nav_date"]) < str(best_row["nav_date"]):
+                    best_row = row
+
+        if best_row is None:
             return None
-        return self._row_to_nav(row)
+        return self._row_to_nav(best_row)
 
     def get_latest_nav_record(self, fund_code: Any) -> dict[str, Any] | None:
         records = self.list_fund_nav_history(fund_code=fund_code, limit=1)

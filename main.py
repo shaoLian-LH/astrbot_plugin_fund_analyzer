@@ -11,7 +11,7 @@ from datetime import date, datetime, time as dt_time, timedelta
 from pathlib import Path
 from typing import Any
 
-from astrbot.api import logger
+from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, StarTools, register
 from astrbot.core.utils.t2i.renderer import HtmlRenderer
@@ -321,11 +321,17 @@ class FundAnalyzer:
 
 # 贵金属价格缓存TTL（15分钟）
 METAL_CACHE_TTL = 900
-# 持仓基金净值定时同步间隔（秒）
-NAV_SYNC_INTERVAL_SECONDS = 1800
+# 盘中基金净值自动同步间隔（秒）
+NAV_SYNC_INTERVAL_SECONDS = 180
 NAV_SYNC_DEFAULT_FETCH_DAYS = 120
 NAV_SYNC_MAX_FETCH_DAYS = 365
 NAV_SYNC_FETCH_BUFFER_DAYS = 5
+NAV_SYNC_HOLIDAY_API_URL = "http://api.haoshenqi.top/holiday"
+NAV_SYNC_HOLIDAY_MAX_RETRIES = 3
+NAV_SYNC_HOLIDAY_TIMEOUT_SECONDS = 8
+NAV_SYNC_TIMEZONE = "Asia/Shanghai"
+NAV_SYNC_INTRADAY_START = "09:40"
+NAV_SYNC_INTRADAY_END = "14:55"
 
 
 @register(
@@ -352,10 +358,61 @@ class FundAnalyzerPlugin(Star):
         "msci",
     )
 
-    def __init__(self, context: Context):
+    def __init__(self, context: Context, config: AstrBotConfig | None = None):
         super().__init__(context)
+        self.config = config
         self.analyzer = FundAnalyzer()
         self.data_handler = DataHandler()
+
+        nav_sync_interval_seconds = self._read_int_config(
+            key="nav_sync_interval_seconds",
+            default=NAV_SYNC_INTERVAL_SECONDS,
+            min_value=60,
+        )
+        nav_sync_default_fetch_days = self._read_int_config(
+            key="nav_sync_default_fetch_days",
+            default=NAV_SYNC_DEFAULT_FETCH_DAYS,
+            min_value=1,
+        )
+        nav_sync_max_fetch_days = self._read_int_config(
+            key="nav_sync_max_fetch_days",
+            default=NAV_SYNC_MAX_FETCH_DAYS,
+            min_value=1,
+        )
+        if nav_sync_max_fetch_days < nav_sync_default_fetch_days:
+            nav_sync_max_fetch_days = nav_sync_default_fetch_days
+        nav_sync_fetch_buffer_days = self._read_int_config(
+            key="nav_sync_fetch_buffer_days",
+            default=NAV_SYNC_FETCH_BUFFER_DAYS,
+            min_value=1,
+        )
+        nav_sync_holiday_api_url = self._read_text_config(
+            key="nav_sync_holiday_api_url",
+            default=NAV_SYNC_HOLIDAY_API_URL,
+        )
+        nav_sync_holiday_max_retries = self._read_int_config(
+            key="nav_sync_holiday_max_retries",
+            default=NAV_SYNC_HOLIDAY_MAX_RETRIES,
+            min_value=1,
+        )
+        nav_sync_holiday_timeout_seconds = self._read_int_config(
+            key="nav_sync_holiday_timeout_seconds",
+            default=NAV_SYNC_HOLIDAY_TIMEOUT_SECONDS,
+            min_value=3,
+        )
+        nav_sync_timezone = self._read_text_config(
+            key="nav_sync_timezone",
+            default=NAV_SYNC_TIMEZONE,
+        )
+        nav_sync_intraday_start_time = self._read_time_config(
+            key="nav_sync_intraday_start",
+            default_text=NAV_SYNC_INTRADAY_START,
+        )
+        nav_sync_intraday_end_time = self._read_time_config(
+            key="nav_sync_intraday_end",
+            default_text=NAV_SYNC_INTRADAY_END,
+        )
+
         # 初始化股票分析器
         self.stock_analyzer = StockAnalyzer()
         # 领域服务
@@ -369,10 +426,16 @@ class FundAnalyzerPlugin(Star):
             data_handler=self.data_handler,
             analyzer=self.analyzer,
             logger=logger,
-            interval_seconds=NAV_SYNC_INTERVAL_SECONDS,
-            default_fetch_days=NAV_SYNC_DEFAULT_FETCH_DAYS,
-            max_fetch_days=NAV_SYNC_MAX_FETCH_DAYS,
-            fetch_buffer_days=NAV_SYNC_FETCH_BUFFER_DAYS,
+            interval_seconds=nav_sync_interval_seconds,
+            default_fetch_days=nav_sync_default_fetch_days,
+            max_fetch_days=nav_sync_max_fetch_days,
+            fetch_buffer_days=nav_sync_fetch_buffer_days,
+            intraday_start_time=nav_sync_intraday_start_time,
+            intraday_end_time=nav_sync_intraday_end_time,
+            holiday_api_url=nav_sync_holiday_api_url,
+            holiday_max_retries=nav_sync_holiday_max_retries,
+            holiday_timeout_seconds=nav_sync_holiday_timeout_seconds,
+            timezone_name=nav_sync_timezone,
         )
         # 初始化图片渲染器
         self.image_renderer = HtmlRenderer()
@@ -404,6 +467,49 @@ class FundAnalyzerPlugin(Star):
             logger.warning(
                 f"基金分析插件依赖未完全安装: {e}\n请执行: pip install akshare pandas"
             )
+
+    def _config_get(self, key: str, default: Any) -> Any:
+        if self.config is None:
+            return default
+        try:
+            value = self.config.get(key)
+        except Exception:
+            return default
+        return default if value is None else value
+
+    def _read_int_config(
+        self,
+        key: str,
+        default: int,
+        min_value: int = 0,
+        max_value: int | None = None,
+    ) -> int:
+        raw_value = self._config_get(key, default)
+        try:
+            number = int(raw_value)
+        except Exception:
+            number = int(default)
+
+        if number < min_value:
+            number = min_value
+        if max_value is not None and number > max_value:
+            number = max_value
+        return number
+
+    def _read_text_config(self, key: str, default: str) -> str:
+        value = str(self._config_get(key, default) or "").strip()
+        return value or str(default)
+
+    def _read_time_config(self, key: str, default_text: str) -> dt_time:
+        default_time = datetime.strptime(default_text, "%H:%M").time()
+        raw_text = str(self._config_get(key, default_text) or "").strip()
+        if not raw_text:
+            return default_time
+        try:
+            return datetime.strptime(raw_text, "%H:%M").time()
+        except ValueError:
+            logger.warning(f"配置项 {key} 无效（{raw_text}），已使用默认值 {default_text}")
+            return default_time
 
     def _load_user_settings(self) -> dict[str, str]:
         """从文件加载用户设置"""
