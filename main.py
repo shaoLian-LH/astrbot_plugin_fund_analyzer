@@ -338,7 +338,7 @@ NAV_SYNC_INTRADAY_END = "14:55"
     "astrbot_plugin_fund_analyzer",
     "2529huang",
     "基金数据分析插件 - 使用AKShare获取LOF/ETF基金数据",
-    "1.3.0",
+    "1.4.0",
 )
 class FundAnalyzerPlugin(Star):
     """基金分析插件主类"""
@@ -1012,6 +1012,430 @@ class FundAnalyzerPlugin(Star):
     @staticmethod
     def _format_nav_sync_result(stats: dict[str, Any], title: str) -> str:
         return format_nav_sync_result(stats, title)
+
+    @staticmethod
+    def _portfolio_signal_from_score(score: float) -> str:
+        if score >= 60:
+            return "强烈偏多"
+        if score >= 30:
+            return "偏多"
+        if score >= -30:
+            return "中性"
+        if score >= -60:
+            return "偏空"
+        return "强烈偏空"
+
+    @staticmethod
+    def _portfolio_risk_level(
+        top1_weight: float,
+        weighted_volatility: float | None,
+        weighted_drawdown: float | None,
+        weighted_sharpe: float | None,
+    ) -> tuple[str, str]:
+        vol = float(weighted_volatility or 0.0)
+        drawdown = float(weighted_drawdown or 0.0)
+        sharpe = float(weighted_sharpe or 0.0)
+        vol_risky = weighted_volatility is not None and vol >= 32
+        drawdown_risky = weighted_drawdown is not None and drawdown >= 20
+        sharpe_risky = weighted_sharpe is not None and sharpe <= -0.3
+        if top1_weight >= 55 or vol_risky or drawdown_risky or sharpe_risky:
+            return "高", "仓位集中或波动偏高，建议优先控制回撤风险"
+        vol_medium = weighted_volatility is not None and vol >= 20
+        drawdown_medium = weighted_drawdown is not None and drawdown >= 12
+        sharpe_medium = weighted_sharpe is not None and sharpe < 0.5
+        if top1_weight >= 35 or vol_medium or drawdown_medium or sharpe_medium:
+            return "中", "组合存在阶段性波动，建议保持仓位纪律并关注回撤"
+        return "低", "组合分散度较好，波动相对可控"
+
+    @staticmethod
+    def _signal_class(signal: str) -> str:
+        text = str(signal or "").strip()
+        if "强烈买入" in text or text == "买入":
+            return "buy"
+        if "强烈卖出" in text or text == "卖出":
+            return "sell"
+        return "neutral"
+
+    @staticmethod
+    def _to_markdown_html(markdown_text: str) -> str:
+        text = str(markdown_text or "").strip()
+        if not text:
+            return ""
+
+        try:
+            import markdown
+
+            return markdown.markdown(
+                text,
+                extensions=["nl2br", "tables", "fenced_code"],
+            )
+        except Exception:
+            import re
+
+            html_text = re.sub(r"\*\*(.*?)\*\*", r"<strong>\1</strong>", text)
+            return html_text.replace("\n", "<br>")
+
+    def _build_position_ai_prompt(
+        self,
+        summary: dict[str, Any],
+        rows: list[dict[str, Any]],
+    ) -> str:
+        holding_lines: list[str] = []
+        for row in rows[:12]:
+            volatility_text = (
+                "--" if row.get("volatility") is None else f"{float(row['volatility']):.2f}%"
+            )
+            drawdown_text = (
+                "--"
+                if row.get("max_drawdown") is None
+                else f"{float(row['max_drawdown']):.2f}%"
+            )
+            sharpe_text = (
+                "--" if row.get("sharpe_ratio") is None else f"{float(row['sharpe_ratio']):.2f}"
+            )
+            holding_lines.append(
+                (
+                    f"- {row['name']}({row['code']}): "
+                    f"市值{row['market_value']:.2f}, 权重{row['weight']:.2f}%, "
+                    f"收益{row['profit_amount']:+.2f}({row['profit_rate']:+.2f}%), "
+                    f"日涨跌{row['change_rate']:+.2f}%, "
+                    f"信号={row['signal']}(分数{row['score']:+d}), "
+                    f"波动率={volatility_text}, "
+                    f"最大回撤={drawdown_text}, "
+                    f"夏普={sharpe_text}"
+                )
+            )
+
+        holdings_text = "\n".join(holding_lines) if holding_lines else "- 暂无可用持仓数据"
+
+        return f"""你是一位专业基金组合经理，请基于以下持仓数据做“组合级”分析（不是单基金分析）。
+
+## 组合概览
+- 持仓基金数: {summary.get('funds_count', 0)}
+- 总成本: {summary.get('total_cost', 0.0):.2f}
+- 总市值: {summary.get('total_market', 0.0):.2f}
+- 总收益: {summary.get('total_profit', 0.0):+.2f} ({summary.get('total_profit_rate', 0.0):+.2f}%)
+- 组合当日加权涨跌: {summary.get('weighted_change_rate', 0.0):+.2f}%
+- 组合当日估算盈亏: {summary.get('estimated_today_pnl', 0.0):+.2f}
+- 前1大持仓占比: {summary.get('top1_weight', 0.0):.2f}%
+- 前3大持仓占比: {summary.get('top3_weight', 0.0):.2f}%
+- 组合加权波动率: {summary.get('weighted_volatility_text', '--')}
+- 组合加权最大回撤: {summary.get('weighted_drawdown_text', '--')}
+- 组合加权夏普: {summary.get('weighted_sharpe_text', '--')}
+- 组合技术信号: {summary.get('portfolio_signal', '中性')}
+- 风险等级: {summary.get('risk_level', '中')}（{summary.get('risk_hint', '')}）
+
+## 持仓明细
+{holdings_text}
+
+## 输出要求（中文）
+1. 组合结构诊断：收益来源、风险敞口、集中度是否合理
+2. 风险评估：回撤、波动、相关性/同涨同跌风险
+3. 优化建议：给出可执行的调仓思路（增配/减配方向）
+4. 操作计划：分成短期(1-2周)和中期(1-2月)
+5. 风险控制：止损/止盈或仓位上限建议
+
+要求：
+- 建议必须具体、可执行，避免空泛表述
+- 语气专业克制，不承诺收益
+- 总字数控制在 600 字以内"""
+
+    def _build_position_ai_fallback_text(
+        self,
+        summary: dict[str, Any],
+        rows: list[dict[str, Any]],
+    ) -> str:
+        if not rows:
+            return "当前有效持仓数据不足，无法生成组合分析。"
+
+        top_gain = max(rows, key=lambda item: float(item.get("profit_amount", 0.0)))
+        top_loss = min(rows, key=lambda item: float(item.get("profit_amount", 0.0)))
+        top_weight = rows[0]
+
+        lines = [
+            "### 组合量化结论（模型未配置，基于量化规则）",
+            f"- 当前组合信号：**{summary.get('portfolio_signal', '中性')}**",
+            (
+                f"- 总收益：**{summary.get('total_profit', 0.0):+.2f}** "
+                f"({summary.get('total_profit_rate', 0.0):+.2f}%)"
+            ),
+            (
+                f"- 集中度：前1大持仓 **{summary.get('top1_weight', 0.0):.2f}%**，"
+                f"前3大持仓 **{summary.get('top3_weight', 0.0):.2f}%**"
+            ),
+            (
+                f"- 风险等级：**{summary.get('risk_level', '中')}**，"
+                f"{summary.get('risk_hint', '建议控制回撤')}"
+            ),
+            (
+                f"- 最大盈利持仓：**{top_gain['name']}({top_gain['code']})** "
+                f"{top_gain['profit_amount']:+.2f} ({top_gain['profit_rate']:+.2f}%)"
+            ),
+            (
+                f"- 最大回撤来源：**{top_loss['name']}({top_loss['code']})** "
+                f"{top_loss['profit_amount']:+.2f} ({top_loss['profit_rate']:+.2f}%)"
+            ),
+            (
+                f"- 当前主仓：**{top_weight['name']}({top_weight['code']})** "
+                f"占比 {top_weight['weight']:.2f}%"
+            ),
+            "",
+            "### 建议动作",
+            "1. 单只持仓建议控制在 35% 以内，避免单基金波动放大组合回撤。",
+            "2. 亏损且技术信号偏弱的持仓可分批降仓，回收仓位到低相关方向。",
+            "3. 保留一定机动仓位，优先在回撤后而非追涨时再平衡。",
+            "",
+            "_提示：配置 LLM 提供商后，可获得更完整的AI组合解读。_",
+        ]
+        return "\n".join(lines)
+
+    async def _build_position_ai_analysis_data(
+        self,
+        positions: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        valid_positions = [
+            item
+            for item in positions
+            if float(item.get("shares", 0) or 0) > 0
+            and self._normalize_ssgz_fund_code(item.get("fund_code"))
+        ]
+        if not valid_positions:
+            return {"rows": [], "summary": {}}
+
+        fund_codes: list[str] = []
+        seen_codes = set()
+        for item in valid_positions:
+            code = self._normalize_ssgz_fund_code(item.get("fund_code"))
+            if code and code not in seen_codes:
+                seen_codes.add(code)
+                fund_codes.append(code)
+
+        fund_infos = await self._batch_fetch_position_realtime_infos(
+            fund_codes,
+            max_concurrency=6,
+        )
+
+        semaphore = asyncio.Semaphore(4)
+
+        async def fetch_history(code: str) -> tuple[str, list[dict[str, Any]]]:
+            async with semaphore:
+                try:
+                    history = await self.analyzer.get_lof_history(code, days=90)
+                except Exception as e:
+                    logger.debug(f"持仓智能分析拉取历史失败: {code}, {e}")
+                    history = None
+            return code, list(history or [])
+
+        tasks = [asyncio.create_task(fetch_history(code)) for code in fund_codes]
+        history_results = await asyncio.gather(*tasks, return_exceptions=True)
+        history_map: dict[str, list[dict[str, Any]]] = {}
+        for item in history_results:
+            if isinstance(item, Exception):
+                continue
+            code, history = item
+            history_map[code] = history
+
+        quant = self.ai_analyzer.quant
+        rows: list[dict[str, Any]] = []
+        total_cost = 0.0
+        total_market = 0.0
+        missing_quote_funds = 0
+
+        for item in valid_positions:
+            code = self._normalize_ssgz_fund_code(item.get("fund_code"))
+            if not code:
+                continue
+
+            shares = float(item.get("shares", 0) or 0)
+            if shares <= 0:
+                continue
+
+            avg_cost = float(item.get("avg_cost", 0) or 0)
+            local_name = str(item.get("fund_name") or "").strip()
+            info = fund_infos.get(code)
+            name = (
+                info.name
+                if info and getattr(info, "name", "")
+                else local_name or code
+            )
+
+            latest_price = float(getattr(info, "latest_price", 0) or 0) if info else 0.0
+            change_rate = float(getattr(info, "change_rate", 0) or 0) if info else 0.0
+            if latest_price <= 0:
+                latest_price = avg_cost
+                missing_quote_funds += 1
+
+            cost_amount = avg_cost * shares
+            market_value = latest_price * shares
+            profit_amount = market_value - cost_amount
+            profit_rate = (profit_amount / cost_amount * 100) if cost_amount > 0 else 0.0
+
+            history = history_map.get(code) or []
+            performance = quant.calculate_performance(history) if len(history) >= 5 else None
+            indicators = quant.calculate_all_indicators(history) if len(history) >= 5 else None
+
+            signal = indicators.signal if indicators else "数据不足"
+            score = int(indicators.trend_score) if indicators else 0
+
+            row = {
+                "name": name,
+                "code": code,
+                "shares": shares,
+                "avg_cost": avg_cost,
+                "latest_price": latest_price,
+                "change_rate": change_rate,
+                "cost_amount": cost_amount,
+                "market_value": market_value,
+                "profit_amount": profit_amount,
+                "profit_rate": profit_rate,
+                "history_days": len(history),
+                "signal": signal,
+                "score": score,
+                "signal_class": self._signal_class(signal),
+                "volatility": (
+                    float(performance.volatility)
+                    if performance and performance.volatility is not None
+                    else None
+                ),
+                "max_drawdown": (
+                    float(performance.max_drawdown)
+                    if performance and performance.max_drawdown is not None
+                    else None
+                ),
+                "sharpe_ratio": (
+                    float(performance.sharpe_ratio)
+                    if performance and performance.sharpe_ratio is not None
+                    else None
+                ),
+                "total_return": (
+                    float(performance.total_return)
+                    if performance and performance.total_return is not None
+                    else None
+                ),
+                "weight": 0.0,
+                "weight_fraction": 0.0,
+            }
+            rows.append(row)
+            total_cost += cost_amount
+            total_market += market_value
+
+        if not rows:
+            return {"rows": [], "summary": {}}
+
+        rows.sort(key=lambda item: float(item.get("market_value", 0.0)), reverse=True)
+
+        for row in rows:
+            weight_fraction = (
+                float(row["market_value"]) / total_market if total_market > 0 else 0.0
+            )
+            row["weight_fraction"] = weight_fraction
+            row["weight"] = weight_fraction * 100
+
+        def weighted_average(metric_key: str) -> float | None:
+            values = [
+                (
+                    float(row[metric_key]),
+                    float(row["weight_fraction"]),
+                )
+                for row in rows
+                if row.get(metric_key) is not None
+            ]
+            if not values:
+                return None
+            weight_sum = sum(weight for _, weight in values)
+            if weight_sum <= 0:
+                return None
+            return sum(value * weight for value, weight in values) / weight_sum
+
+        weighted_volatility = weighted_average("volatility")
+        weighted_drawdown = weighted_average("max_drawdown")
+        weighted_sharpe = weighted_average("sharpe_ratio")
+        weighted_score = weighted_average("score") or 0.0
+        weighted_change_rate = weighted_average("change_rate") or 0.0
+
+        top1_weight = float(rows[0]["weight"]) if rows else 0.0
+        top3_weight = sum(float(row["weight"]) for row in rows[:3])
+        risk_level, risk_hint = self._portfolio_risk_level(
+            top1_weight=top1_weight,
+            weighted_volatility=weighted_volatility,
+            weighted_drawdown=weighted_drawdown,
+            weighted_sharpe=weighted_sharpe,
+        )
+
+        total_profit = total_market - total_cost
+        total_profit_rate = (total_profit / total_cost * 100) if total_cost > 0 else 0.0
+        estimated_today_pnl = total_market * weighted_change_rate / 100
+
+        summary = {
+            "funds_count": len(rows),
+            "total_cost": total_cost,
+            "total_market": total_market,
+            "total_profit": total_profit,
+            "total_profit_rate": total_profit_rate,
+            "weighted_change_rate": weighted_change_rate,
+            "estimated_today_pnl": estimated_today_pnl,
+            "top1_weight": top1_weight,
+            "top3_weight": top3_weight,
+            "weighted_volatility": weighted_volatility,
+            "weighted_drawdown": weighted_drawdown,
+            "weighted_sharpe": weighted_sharpe,
+            "weighted_score": weighted_score,
+            "portfolio_signal": self._portfolio_signal_from_score(weighted_score),
+            "risk_level": risk_level,
+            "risk_hint": risk_hint,
+            "weighted_volatility_text": (
+                f"{weighted_volatility:.2f}%"
+                if weighted_volatility is not None
+                else "--"
+            ),
+            "weighted_drawdown_text": (
+                f"{weighted_drawdown:.2f}%"
+                if weighted_drawdown is not None
+                else "--"
+            ),
+            "weighted_sharpe_text": (
+                f"{weighted_sharpe:.2f}" if weighted_sharpe is not None else "--"
+            ),
+            "data_ready_funds": sum(1 for row in rows if int(row["history_days"]) >= 20),
+            "missing_quote_funds": missing_quote_funds,
+            "signal_buy_count": sum(1 for row in rows if int(row["score"]) >= 30),
+            "signal_neutral_count": sum(
+                1 for row in rows if -30 < int(row["score"]) < 30
+            ),
+            "signal_sell_count": sum(1 for row in rows if int(row["score"]) <= -30),
+        }
+        return {"rows": rows, "summary": summary}
+
+    def _build_position_ai_plain_report(
+        self,
+        summary: dict[str, Any],
+        rows: list[dict[str, Any]],
+        analysis_text: str,
+    ) -> str:
+        lines = [
+            "🤖 基金持仓智能分析报告",
+            "━━━━━━━━━━━━━━━━━",
+            f"📌 持仓基金数: {summary.get('funds_count', 0)}",
+            f"💰 总成本: {summary.get('total_cost', 0.0):,.2f}",
+            f"🏦 总市值: {summary.get('total_market', 0.0):,.2f}",
+            (
+                f"💵 总收益: {summary.get('total_profit', 0.0):+,.2f} "
+                f"({summary.get('total_profit_rate', 0.0):+.2f}%)"
+            ),
+            f"📊 组合信号: {summary.get('portfolio_signal', '中性')}",
+            f"⚠️ 风险等级: {summary.get('risk_level', '中')} ({summary.get('risk_hint', '')})",
+            "━━━━━━━━━━━━━━━━━",
+        ]
+
+        for index, row in enumerate(rows[:8], start=1):
+            lines.append(
+                f"{index}. {row['name']}({row['code']}) | 权重 {row['weight']:.2f}% | "
+                f"收益 {row['profit_amount']:+,.2f} ({row['profit_rate']:+.2f}%) | 信号 {row['signal']}"
+            )
+
+        lines.append("━━━━━━━━━━━━━━━━━")
+        lines.append(analysis_text.strip())
+        return "\n".join(lines)
 
     @staticmethod
     def _ssgz_usage_text() -> str:
@@ -2026,6 +2450,114 @@ class FundAnalyzerPlugin(Star):
             logger.error(f"手动刷新持仓基金净值失败: {e}")
             yield event.plain_result(f"❌ 净值刷新失败: {str(e)}")
 
+    @filter.command("基金持仓智能分析")
+    async def ai_position_analysis(self, event: AstrMessageEvent):
+        """
+        对当前用户持仓做组合级智能分析并输出图像报告。
+        用法: 基金持仓智能分析
+        """
+        try:
+            self._ensure_nav_sync_task()
+            platform, user_id = self._resolve_position_owner(event)
+            if not user_id:
+                yield event.plain_result("❌ 无法识别当前用户 ID，请稍后再试")
+                return
+
+            positions = self.data_handler.list_positions(platform=platform, user_id=user_id)
+            if not positions:
+                yield event.plain_result(
+                    "📭 当前没有基金持仓记录\n"
+                    "💡 请先补充基金信息：增加基金持仓 {基金代码,平均成本,持有份额}\n"
+                    "💡 示例: 增加基金持仓 {161226,1.0234,1200}"
+                )
+                return
+
+            yield event.plain_result(
+                "🤖 正在生成你的基金持仓智能分析报告...\n"
+                "📊 正在汇总持仓、行情与量化指标..."
+            )
+
+            analysis_data = await self._build_position_ai_analysis_data(positions)
+            rows = analysis_data.get("rows") or []
+            summary = analysis_data.get("summary") or {}
+            if not rows:
+                yield event.plain_result(
+                    "⚠️ 当前持仓缺少有效份额或基金代码\n"
+                    "💡 请先补充基金信息：增加基金持仓 {基金代码,平均成本,持有份额}"
+                )
+                return
+
+            provider = self.context.get_using_provider()
+            if provider:
+                prompt = self._build_position_ai_prompt(summary, rows)
+                try:
+                    response = await provider.text_chat(
+                        prompt=prompt,
+                        session_id=f"fund_position_analysis_{user_id}",
+                        persist=False,
+                    )
+                    analysis_text = str(response.completion_text or "").strip()
+                except Exception as e:
+                    logger.warning(f"持仓智能分析调用大模型失败，回退量化结论: {e}")
+                    analysis_text = self._build_position_ai_fallback_text(summary, rows)
+            else:
+                analysis_text = self._build_position_ai_fallback_text(summary, rows)
+
+            if not analysis_text:
+                analysis_text = self._build_position_ai_fallback_text(summary, rows)
+
+            template_data = {
+                **summary,
+                "positions": rows,
+                "analysis_content": self._to_markdown_html(analysis_text),
+                "llm_available": bool(provider),
+                "generated_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            }
+
+            template_path = self._data_dir / "templates" / "position_ai_analysis_report.html"
+            if not template_path.exists():
+                template_path = (
+                    Path(__file__).parent / "templates" / "position_ai_analysis_report.html"
+                )
+
+            if not template_path.exists():
+                yield event.plain_result(
+                    self._build_position_ai_plain_report(summary, rows, analysis_text)
+                )
+                return
+
+            if self.use_local_renderer:
+                try:
+                    img_path = await render_fund_image(
+                        template_path=template_path,
+                        template_data=template_data,
+                        width=640,
+                    )
+                    yield event.image_result(img_path)
+                except Exception as e:
+                    logger.warning(f"持仓智能分析本地渲染失败，回退网络渲染: {e}")
+                    with open(template_path, "r", encoding="utf-8") as f:
+                        template_str = f.read()
+                    img_url = await self.image_renderer.render_custom_template(
+                        tmpl_str=template_str,
+                        tmpl_data=template_data,
+                        return_url=True,
+                    )
+                    yield event.image_result(img_url)
+            else:
+                with open(template_path, "r", encoding="utf-8") as f:
+                    template_str = f.read()
+                img_url = await self.image_renderer.render_custom_template(
+                    tmpl_str=template_str,
+                    tmpl_data=template_data,
+                    return_url=True,
+                )
+                yield event.image_result(img_url)
+
+        except Exception as e:
+            logger.error(f"基金持仓智能分析失败: {e}")
+            yield event.plain_result(f"❌ 基金持仓智能分析失败: {str(e)}")
+
     @filter.command("智能分析")
     async def ai_fund_analysis(self, event: AstrMessageEvent, code: str = ""):
         """
@@ -2475,6 +3007,7 @@ class FundAnalyzerPlugin(Star):
 🔹 清仓基金 [基金代码] [份额|百分比] - 卖出基金份额（默认全仓）
 🔹 sscc - 查看当前持仓基金现价与最近收盘涨跌幅
 🔹 ckcc - 查看当前持仓与收益
+🔹 基金持仓智能分析 - 🤖对当前持仓进行组合级AI分析并输出图像报告
 🔹 修复基金持仓数据 - 修复当前用户的持仓相关基金数据
 🔹 ckqcjl [条数] - 查看清仓/卖出历史记录
 🔹 更新持仓基金净值 - 主动刷新持仓基金净值（增量）
@@ -2498,6 +3031,7 @@ class FundAnalyzerPlugin(Star):
   • 增加基金持仓 {161226,1.0234,1200} {001632,2.1456,500}
   • 清仓基金 161226 25%
   • sscc
+  • 基金持仓智能分析
   • ckqcjl 20
   • ckcc
   • 修复基金持仓数据
