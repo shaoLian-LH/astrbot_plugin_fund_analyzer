@@ -6,6 +6,7 @@ AstrBot 基金数据分析插件
 
 import asyncio
 import json
+import re
 from dataclasses import dataclass
 from datetime import date, datetime, time as dt_time, timedelta
 from pathlib import Path
@@ -338,7 +339,7 @@ NAV_SYNC_INTRADAY_END = "14:55"
     "astrbot_plugin_fund_analyzer",
     "2529huang",
     "基金数据分析插件 - 使用AKShare获取LOF/ETF基金数据",
-    "1.4.1",
+    "1.5.0",
 )
 class FundAnalyzerPlugin(Star):
     """基金分析插件主类"""
@@ -446,6 +447,7 @@ class FundAnalyzerPlugin(Star):
         # 获取插件数据目录
         self._data_dir = Path(StarTools.get_data_dir("fund_analyzer"))
         self._data_dir.mkdir(parents=True, exist_ok=True)
+        self.market_service.set_data_dir(self._data_dir)
         # 加载用户设置
         self.user_fund_settings: dict[str, str] = self._load_user_settings()
         # QDII 识别缓存（跨命令复用）
@@ -1482,15 +1484,14 @@ class FundAnalyzerPlugin(Star):
     def _format_precious_metal_prices(self, prices: dict) -> str:
         return format_precious_metal_prices(prices)
 
-    @filter.command("今日行情")
-    async def today_market(self, event: AstrMessageEvent):
+    @filter.command("贵金属行情")
+    async def precious_metal_market(self, event: AstrMessageEvent):
         """
-        查询今日贵金属行情
-        用法: 今日行情
-        返回国际金价、银价及涨跌幅
+        查询贵金属行情（当前仅黄金）
+        用法: 贵金属行情
         """
         try:
-            yield event.plain_result("🔍 正在获取今日贵金属行情...")
+            yield event.plain_result("🔍 正在获取贵金属行情（当前仅黄金）...")
 
             prices = await self._fetch_precious_metal_prices()
 
@@ -1500,8 +1501,61 @@ class FundAnalyzerPlugin(Star):
                 yield event.plain_result("❌ 获取贵金属行情失败，请稍后重试")
 
         except Exception as e:
-            logger.error(f"获取今日行情出错: {e}")
+            logger.error(f"获取贵金属行情出错: {e}")
             yield event.plain_result(f"❌ 获取行情失败: {str(e)}")
+
+    @filter.command("更新今日汇率")
+    async def update_today_exchange_rate(self, event: AstrMessageEvent, rate_text: str = ""):
+        """
+        手动更新今日美元兑人民币汇率
+        用法: 更新今日汇率 <1美元兑人民币>
+        示例: 更新今日汇率 6.91
+        """
+        payload = self._extract_command_payload(event, "更新今日汇率")
+        raw_text = payload or str(rate_text or "").strip()
+        if not raw_text:
+            yield event.plain_result(
+                "💡 用法: 更新今日汇率 <1美元兑人民币>\n"
+                "💡 示例: 更新今日汇率 6.91"
+            )
+            return
+
+        matches = re.findall(r"\d+(?:\.\d+)?", raw_text)
+        if not matches:
+            yield event.plain_result(
+                "❌ 未识别到有效汇率\n"
+                "💡 用法: 更新今日汇率 <1美元兑人民币>\n"
+                "💡 示例: 更新今日汇率 6.91"
+            )
+            return
+
+        if (
+            len(matches) == 1
+            and matches[0] == "1"
+            and "美元兑人民币" in raw_text
+        ):
+            yield event.plain_result(
+                "❌ 请填写实际汇率数值\n"
+                "💡 示例: 更新今日汇率 6.91"
+            )
+            return
+
+        rate = float(matches[-1])
+        if rate <= 0:
+            yield event.plain_result("❌ 汇率必须大于0")
+            return
+
+        try:
+            record = self.market_service.update_today_exchange_rate(rate)
+            yield event.plain_result(
+                "✅ 今日汇率已更新\n"
+                f"💱 1美元 = {float(record.get('rate', 0)):.4f}人民币\n"
+                f"📅 日期: {record.get('date', date.today().isoformat())}\n"
+                "💡 现在可重新发送「贵金属行情」获取人民币折算结果"
+            )
+        except Exception as e:
+            logger.error(f"更新今日汇率失败: {e}")
+            yield event.plain_result(f"❌ 更新汇率失败: {str(e)}")
 
     @filter.command("股票")
     async def stock_query(self, event: AstrMessageEvent, code: str = ""):
@@ -2987,7 +3041,8 @@ class FundAnalyzerPlugin(Star):
 📊 基金/股票分析插件帮助
 ━━━━━━━━━━━━━━━━━
 💰 贵金属行情:
-🔹 今日行情 - 查询金价银价实时行情
+🔹 贵金属行情 - 查询黄金行情（COMEX + 人民币折算）
+🔹 更新今日汇率 <1美元兑人民币> - 手动补充当日汇率
 ━━━━━━━━━━━━━━━━━
 📈 A股实时行情 (缓存10分钟):
 🔹 股票 <代码> - 查询A股实时行情
@@ -3017,7 +3072,8 @@ class FundAnalyzerPlugin(Star):
    基金代码: 161226
 ━━━━━━━━━━━━━━━━━
 📈 示例:
-  • 今日行情 (金银价格)
+  • 贵金属行情 (黄金 + 人民币折算)
+  • 更新今日汇率 6.91
   • 股票 000001 (平安银行)
   • 搜索股票 茅台
   • ssgz 001632

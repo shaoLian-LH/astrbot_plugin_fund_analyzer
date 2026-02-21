@@ -207,59 +207,101 @@ def format_stock_info(info: Any) -> str:
 
 def format_precious_metal_prices(prices: dict[str, Any]) -> str:
     if not prices:
-        return "❌ 获取贵金属价格失败，请稍后重试"
+        return "❌ 获取贵金属行情失败，请稍后重试"
+
+    comex = prices.get("comex_gold") or {}
+    domestic = prices.get("domestic_gold") or {}
+    fx = prices.get("exchange_rate") or {}
 
     def parse_change_rate(rate_str: str) -> float:
         try:
-            return float(rate_str.replace("%", "").replace("+", ""))
-        except (ValueError, AttributeError):
+            return float(str(rate_str).replace("%", "").replace("+", "").strip())
+        except (ValueError, TypeError):
             return 0.0
 
-    def format_item(data: dict[str, Any], unit: str = "美元/盎司", divisor: float = 1.0) -> str:
-        if not data:
-            return "  暂无数据"
+    def format_number(value: Any, fallback: str = "-") -> str:
+        try:
+            num = float(value)
+            if num == 0:
+                return fallback
+            return f"{num:.2f}"
+        except (TypeError, ValueError):
+            return fallback
 
-        change_rate = parse_change_rate(data.get("change_rate", "0%"))
-        change_emoji = "🔴" if change_rate < 0 else "🟢" if change_rate > 0 else "⚪"
-        trend_emoji = "📈" if change_rate > 0 else "📉" if change_rate < 0 else "➡️"
-
-        price = float(data["price"]) / divisor
-        change = float(data.get("change", 0)) / divisor
-        open_p = float(data.get("open", 0)) / divisor
-        high_p = float(data.get("high", 0)) / divisor
-        low_p = float(data.get("low", 0)) / divisor
-        buy_p = float(data.get("buy_price", 0)) / divisor
-        sell_p = float(data.get("sell_price", 0)) / divisor
-
-        return f"""  {trend_emoji} 最新价: {price:.2f} {unit}
-  {change_emoji} 涨跌: {change:+.2f} ({data.get("change_rate", "0%")})
-  📊 今开: {open_p:.2f} | 最高: {high_p:.2f} | 最低: {low_p:.2f}
-  💹 买入: {buy_p:.2f} | 卖出: {sell_p:.2f}"""
+    comex_price = float(comex.get("price", 0) or 0)
+    change_rate_text = str(comex.get("change_rate", "0%") or "0%")
+    change_rate_value = parse_change_rate(change_rate_text)
+    trend_emoji = "📈" if change_rate_value > 0 else "📉" if change_rate_value < 0 else "➡️"
 
     lines = [
-        "💰 今日贵金属行情（国际现货）",
+        "💰 贵金属行情（黄金）",
         "━━━━━━━━━━━━━━━━━",
+        "🇨🇳 国内金价（元/克）",
     ]
 
-    if "au_td" in prices:
-        lines.append("🥇 黄金")
-        lines.append(format_item(prices["au_td"], "美元/盎司", 1.0))
-        if prices["au_td"].get("update_time"):
-            lines.append(f"  🕐 更新: {prices['au_td']['update_time']}")
-        lines.append("")
+    if domestic:
+        lines.append(f"  💴 最新: {float(domestic.get('price_cny_per_gram', 0)):.2f} 元/克")
+        lines.append(
+            "  🧮 公式: "
+            f"{domestic.get('formula', 'COMEX黄金价格 * 美元兑人民币汇率 / 31.1035')}"
+        )
+        lines.append(
+            "  📌 基础值: "
+            f"{float(domestic.get('base_price_usd_per_ounce', 0)):.2f} 美元/盎司 × "
+            f"{float(domestic.get('usd_cny_rate', 0)):.4f}"
+        )
+    else:
+        lines.append("  ⚠️ 暂无法完成人民币换算（缺少当日美元兑人民币汇率）")
+        hint = str(prices.get("rate_missing_hint", "")).strip()
+        if hint:
+            lines.append(f"  💡 {hint}")
 
-    if "ag_td" in prices:
-        lines.append("🥈 白银")
-        silver_price = prices["ag_td"].get("price", 0)
-        divisor = 100.0 if float(silver_price or 0) > 1000 else 1.0
-        lines.append(format_item(prices["ag_td"], "美元/盎司", divisor))
-        if prices["ag_td"].get("update_time"):
-            lines.append(f"  🕐 更新: {prices['ag_td']['update_time']}")
+    lines.extend(
+        [
+            "",
+            "🌍 COMEX黄金（美元/盎司）",
+            f"  {trend_emoji} 最新: {comex_price:.2f}" if comex_price > 0 else "  📌 最新: -",
+            f"  📊 涨跌: {format_number(comex.get('change', 0), '-')} ({change_rate_text})",
+            (
+                "  📈 今开: "
+                f"{format_number(comex.get('open', 0), '-')} | "
+                f"最高: {format_number(comex.get('high', 0), '-')} | "
+                f"最低: {format_number(comex.get('low', 0), '-')}"
+            ),
+            f"  📋 昨结: {format_number(comex.get('prev_close', 0), '-')}",
+            (
+                "  📦 成交量: "
+                f"{comex.get('volume_text', '-')} | 持仓量: {comex.get('position_text', '-')}"
+            ),
+            (
+                "  🔄 外盘: "
+                f"{comex.get('outer_text', '-')} | 内盘: {comex.get('inner_text', '-')}"
+            ),
+            (
+                "  🧾 仓差: "
+                f"{comex.get('spread_text', '-')} | 日增: {comex.get('day_increment_text', '-')}"
+            ),
+        ]
+    )
+
+    update_time = str(comex.get("update_time", "")).strip()
+    if update_time:
+        lines.append(f"  🕐 行情时间: {update_time}")
+    elif comex.get("fetched_at"):
+        lines.append(f"  🕐 抓取时间: {comex.get('fetched_at')}")
+
+    if fx:
         lines.append("")
+        lines.append(
+            "💱 汇率: "
+            f"1美元 = {float(fx.get('rate', 0)):.4f}人民币 "
+            f"({fx.get('source', 'unknown')})"
+        )
+        if fx.get("source_text"):
+            lines.append(f"📌 汇率来源: {fx.get('source_text')}")
 
     lines.append("━━━━━━━━━━━━━━━━━")
-    lines.append("📌 国际现货24小时交易")
-    lines.append("💡 数据来源: NowAPI | 缓存15分钟")
+    lines.append("💡 当前版本仅提供黄金行情")
+    lines.append("💡 数据来源: 东方财富(COMEX黄金) + Google(美元兑人民币，日更)")
 
     return "\n".join(lines)
-

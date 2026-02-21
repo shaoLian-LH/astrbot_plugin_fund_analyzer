@@ -1,6 +1,6 @@
 name: astrbot_plugin_fund_analyzer_advance
 description: 基金数据分析插件 - 提供实时行情、技术分析、量化指标、策略回测、AI智能分析
-version: 1.4.1
+version: 1.5.0
 author: 2529huang, slfk
 homepage: https://github.com/shaoLian-LH/astrbot_plugin_fund_analyzer
 repo: https://github.com/shaoLian-LH/astrbot_plugin_fund_analyzer
