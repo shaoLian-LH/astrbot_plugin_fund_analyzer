@@ -12,7 +12,7 @@ DEFAULT_DATA_PATH = DEFAULT_DB_PATH
 class DataHandler:
     """基金数据持久化处理器（基金主数据、用户持仓、历史净值）。"""
 
-    SCHEMA_VERSION = "4"
+    SCHEMA_VERSION = "5"
     LEGACY_NAV_TABLE = "fund_nav_history"
     NAV_PARTITION_SUFFIX = "fund_nav_history"
     NAV_PARTITION_TABLE_PATTERN = re.compile(r"^\d{4}_\d{2}_fund_nav_history$")
@@ -105,6 +105,21 @@ class DataHandler:
 
                 CREATE INDEX IF NOT EXISTS idx_fund_nav_history_fund_date
                 ON fund_nav_history(fund_id, nav_date DESC);
+
+                CREATE TABLE IF NOT EXISTS exchange_rate_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    currency_pair TEXT NOT NULL,
+                    rate_date TEXT NOT NULL,
+                    rate REAL NOT NULL,
+                    source TEXT NOT NULL DEFAULT '',
+                    source_text TEXT NOT NULL DEFAULT '',
+                    update_time TEXT NOT NULL DEFAULT '',
+                    query_time TEXT NOT NULL DEFAULT '',
+                    created_at INTEGER NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_exchange_rate_history_pair_date
+                ON exchange_rate_history(currency_pair, rate_date DESC, created_at DESC);
 
                 CREATE TABLE IF NOT EXISTS schema_meta (
                     key TEXT PRIMARY KEY,
@@ -390,6 +405,195 @@ class DataHandler:
             "note": str(row["note"] or ""),
             "created_at": int(row["created_at"]),
         }
+
+    def _row_to_exchange_rate(self, row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "id": int(row["id"]),
+            "currency_pair": str(row["currency_pair"] or ""),
+            "rate_date": str(row["rate_date"]),
+            "rate": float(row["rate"]),
+            "source": str(row["source"] or ""),
+            "source_text": str(row["source_text"] or ""),
+            "update_time": str(row["update_time"] or ""),
+            "query_time": str(row["query_time"] or ""),
+            "created_at": int(row["created_at"]),
+        }
+
+    def add_exchange_rate_record(
+        self,
+        currency_pair: Any,
+        rate: Any,
+        rate_date: Any = None,
+        source: Any = "",
+        source_text: Any = "",
+        update_time: Any = "",
+        query_time: Any = "",
+    ) -> dict[str, Any]:
+        pair = self._normalize_key(currency_pair, fallback="USD/CNY").upper()
+        if not pair:
+            raise ValueError("货币对不能为空")
+
+        rate_num = self._as_positive_float(rate, "汇率")
+        date_text = self._normalize_nav_date(rate_date or date.today().isoformat())
+        now_ts = int(time.time())
+        source_value = str(source or "").strip()
+        source_text_value = str(source_text or "").strip()
+        update_time_value = str(update_time or "").strip()
+        query_time_value = str(query_time or "").strip()
+
+        with self._connect() as conn:
+            conn.execute("BEGIN")
+            cursor = conn.execute(
+                """
+                INSERT INTO exchange_rate_history (
+                    currency_pair,
+                    rate_date,
+                    rate,
+                    source,
+                    source_text,
+                    update_time,
+                    query_time,
+                    created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    pair,
+                    date_text,
+                    rate_num,
+                    source_value,
+                    source_text_value,
+                    update_time_value,
+                    query_time_value,
+                    now_ts,
+                ),
+            )
+            row = conn.execute(
+                """
+                SELECT
+                    id,
+                    currency_pair,
+                    rate_date,
+                    rate,
+                    source,
+                    source_text,
+                    update_time,
+                    query_time,
+                    created_at
+                FROM exchange_rate_history
+                WHERE id = ?
+                """,
+                (int(cursor.lastrowid or 0),),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("汇率记录保存失败")
+            return self._row_to_exchange_rate(row)
+
+    def get_exchange_rate_on_date(
+        self,
+        currency_pair: Any = "USD/CNY",
+        rate_date: Any = None,
+    ) -> dict[str, Any] | None:
+        pair = self._normalize_key(currency_pair, fallback="USD/CNY").upper()
+        date_text = self._normalize_nav_date(rate_date or date.today().isoformat())
+
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT
+                    id,
+                    currency_pair,
+                    rate_date,
+                    rate,
+                    source,
+                    source_text,
+                    update_time,
+                    query_time,
+                    created_at
+                FROM exchange_rate_history
+                WHERE currency_pair = ? AND rate_date = ?
+                ORDER BY created_at DESC, id DESC
+                LIMIT 1
+                """,
+                (pair, date_text),
+            ).fetchone()
+        if row is None:
+            return None
+        return self._row_to_exchange_rate(row)
+
+    def get_latest_exchange_rate(
+        self,
+        currency_pair: Any = "USD/CNY",
+    ) -> dict[str, Any] | None:
+        pair = self._normalize_key(currency_pair, fallback="USD/CNY").upper()
+        if not pair:
+            return None
+
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT
+                    id,
+                    currency_pair,
+                    rate_date,
+                    rate,
+                    source,
+                    source_text,
+                    update_time,
+                    query_time,
+                    created_at
+                FROM exchange_rate_history
+                WHERE currency_pair = ?
+                ORDER BY rate_date DESC, created_at DESC, id DESC
+                LIMIT 1
+                """,
+                (pair,),
+            ).fetchone()
+        if row is None:
+            return None
+        return self._row_to_exchange_rate(row)
+
+    def list_exchange_rate_history(
+        self,
+        currency_pair: Any = "USD/CNY",
+        start_date: Any = None,
+        end_date: Any = None,
+        limit: int = 30,
+    ) -> list[dict[str, Any]]:
+        pair = self._normalize_key(currency_pair, fallback="USD/CNY").upper()
+        if not pair:
+            return []
+
+        date_from = self._normalize_nav_date(start_date) if start_date else None
+        date_to = self._normalize_nav_date(end_date) if end_date else None
+        query_limit = max(1, min(int(limit or 30), 1000))
+
+        sql = """
+            SELECT
+                id,
+                currency_pair,
+                rate_date,
+                rate,
+                source,
+                source_text,
+                update_time,
+                query_time,
+                created_at
+            FROM exchange_rate_history
+            WHERE currency_pair = ?
+        """
+        params: list[Any] = [pair]
+        if date_from:
+            sql += " AND rate_date >= ?"
+            params.append(date_from)
+        if date_to:
+            sql += " AND rate_date <= ?"
+            params.append(date_to)
+        sql += " ORDER BY rate_date DESC, created_at DESC, id DESC LIMIT ?"
+        params.append(query_limit)
+
+        with self._connect() as conn:
+            rows = conn.execute(sql, tuple(params)).fetchall()
+        return [self._row_to_exchange_rate(row) for row in rows]
 
     def _get_fund_by_code_tx(
         self, conn: sqlite3.Connection, fund_code: str

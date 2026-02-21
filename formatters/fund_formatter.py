@@ -299,9 +299,17 @@ def format_precious_metal_prices(prices: dict[str, Any]) -> str:
         )
         if fx.get("source_text"):
             lines.append(f"📌 汇率来源: {fx.get('source_text')}")
+        if fx.get("date"):
+            lines.append(f"📅 汇率日期: {fx.get('date')}")
 
     lines.append("━━━━━━━━━━━━━━━━━")
     lines.append("💡 当前版本仅提供黄金行情")
     lines.append("💡 数据来源: 东方财富(COMEX黄金) + Google(美元兑人民币，日更)")
+    if fx and bool(fx.get("is_fallback")):
+        lines.append(
+            "⚠️ 当前使用最近一次有效汇率数据，"
+            f"{fx.get('stale_hint') or '今日汇率数据可能已经产生了变化，请注意甄别'}"
+        )
+        lines.append("💡 如需修正，请发送：更新今日汇率 <1美元兑人民币>")
 
     return "\n".join(lines)

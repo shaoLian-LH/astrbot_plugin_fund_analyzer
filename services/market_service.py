@@ -1,8 +1,6 @@
-import json
 import re
 from datetime import date, datetime
 from html import unescape
-from pathlib import Path
 from typing import Any
 
 import aiohttp
@@ -27,26 +25,21 @@ class MarketService:
     )
     USD_OUNCE_TO_GRAM = 31.1035
     EXCHANGE_RATE_HINT = "未查询到今日汇率，请发送：更新今日汇率 <1美元兑人民币>"
+    EXCHANGE_RATE_STALE_HINT = "今日汇率数据可能已经产生了变化，请注意甄别"
 
-    def __init__(self, logger: Any, metal_cache_ttl: int = 900):
+    def __init__(
+        self,
+        logger: Any,
+        metal_cache_ttl: int = 900,
+        data_handler: Any | None = None,
+    ):
         self._logger = logger
         self._metal_cache_ttl = metal_cache_ttl
+        self._data_handler = data_handler
         self._metal_cache: dict[str, Any] = {}
         self._metal_cache_time: datetime | None = None
         self._exchange_rate_cache: dict[str, Any] = {}
         self._exchange_rate_query_day: str | None = None
-        self._exchange_rate_cache_path: Path | None = None
-
-    def set_data_dir(self, data_dir: Path) -> None:
-        """设置数据目录，用于持久化当日汇率缓存。"""
-        try:
-            data_dir.mkdir(parents=True, exist_ok=True)
-        except Exception as e:
-            self._logger.warning(f"创建行情缓存目录失败: {e}")
-            return
-
-        self._exchange_rate_cache_path = data_dir / "market_exchange_rate.json"
-        self._load_exchange_rate_cache()
 
     def update_today_exchange_rate(self, rate: float) -> dict[str, Any]:
         """手动更新当日美元兑人民币汇率。"""
@@ -55,7 +48,7 @@ class MarketService:
 
         today = date.today().isoformat()
         now_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        record = {
+        payload = {
             "date": today,
             "rate": float(rate),
             "source": "manual",
@@ -64,9 +57,9 @@ class MarketService:
             "query_time": now_text,
         }
 
-        self._exchange_rate_cache = record
+        record = self._persist_exchange_rate_record(payload)
+        self._exchange_rate_cache = dict(record)
         self._exchange_rate_query_day = today
-        self._save_exchange_rate_cache()
         # 汇率变化会影响折算后的国内金价，清空行情缓存以便立即生效。
         self._metal_cache = {}
         self._metal_cache_time = None
@@ -216,23 +209,30 @@ class MarketService:
     async def _get_today_usd_cny_rate(self) -> dict[str, Any] | None:
         today = date.today().isoformat()
 
-        cached_date = str(self._exchange_rate_cache.get("date", "")).strip()
-        cached_rate = float(self._exchange_rate_cache.get("rate", 0) or 0)
-        if cached_date == today and cached_rate > 0:
-            return self._exchange_rate_cache
+        today_rate = self._get_exchange_rate_on_date(today)
+        if today_rate:
+            today_rate["is_fallback"] = False
+            today_rate["stale_hint"] = ""
+            return today_rate
 
         # 每天只主动查询一次 Google 汇率，避免频繁请求。
-        if self._exchange_rate_query_day == today:
-            return None
+        if self._exchange_rate_query_day != today:
+            self._exchange_rate_query_day = today
+            latest_rate = await self._fetch_usd_cny_rate_from_google()
+            if latest_rate:
+                stored_rate = self._persist_exchange_rate_record(latest_rate)
+                stored_rate["is_fallback"] = False
+                stored_rate["stale_hint"] = ""
+                return stored_rate
 
-        self._exchange_rate_query_day = today
-        latest_rate = await self._fetch_usd_cny_rate_from_google()
-        if not latest_rate:
-            return None
+        # 当日汇率无法获取时，回退到最近一次有效汇率（手动/自动皆可）。
+        latest_valid_rate = self._get_latest_valid_exchange_rate()
+        if latest_valid_rate:
+            latest_valid_rate["is_fallback"] = True
+            latest_valid_rate["stale_hint"] = self.EXCHANGE_RATE_STALE_HINT
+            return latest_valid_rate
 
-        self._exchange_rate_cache = latest_rate
-        self._save_exchange_rate_cache()
-        return self._exchange_rate_cache
+        return None
 
     async def _fetch_usd_cny_rate_from_google(self) -> dict[str, Any] | None:
         headers = {
@@ -392,34 +392,93 @@ class MarketService:
         text = re.sub(r"\s+", " ", text).strip()
         return text
 
-    def _load_exchange_rate_cache(self) -> None:
-        if self._exchange_rate_cache_path is None:
-            return
-        if not self._exchange_rate_cache_path.exists():
-            return
+    @staticmethod
+    def _normalize_exchange_rate_record(raw: dict[str, Any]) -> dict[str, Any]:
+        rate_date = str(raw.get("date", raw.get("rate_date", "")) or "").strip()
+        return {
+            "date": rate_date,
+            "rate": float(raw.get("rate", 0) or 0),
+            "source": str(raw.get("source", "") or "").strip(),
+            "source_text": str(raw.get("source_text", "") or "").strip(),
+            "update_time": str(raw.get("update_time", "") or "").strip(),
+            "query_time": str(raw.get("query_time", "") or "").strip(),
+        }
+
+    @staticmethod
+    def _is_valid_exchange_rate_record(record: dict[str, Any] | None) -> bool:
+        if not isinstance(record, dict):
+            return False
+        date_text = str(record.get("date", "")).strip()
+        if not date_text:
+            return False
+        rate = float(record.get("rate", 0) or 0)
+        return rate > 0
+
+    def _persist_exchange_rate_record(self, payload: dict[str, Any]) -> dict[str, Any]:
+        normalized = self._normalize_exchange_rate_record(payload)
+        if not self._is_valid_exchange_rate_record(normalized):
+            raise ValueError("无效汇率记录")
+
+        if self._data_handler is not None:
+            try:
+                saved = self._data_handler.add_exchange_rate_record(
+                    currency_pair="USD/CNY",
+                    rate=normalized["rate"],
+                    rate_date=normalized["date"],
+                    source=normalized["source"],
+                    source_text=normalized["source_text"],
+                    update_time=normalized["update_time"],
+                    query_time=normalized["query_time"],
+                )
+                normalized = self._normalize_exchange_rate_record(saved)
+            except Exception as e:
+                self._logger.warning(f"写入汇率历史表失败: {e}")
+
+        self._exchange_rate_cache = dict(normalized)
+        return dict(normalized)
+
+    def _get_exchange_rate_on_date(self, rate_date: str) -> dict[str, Any] | None:
+        cached = self._get_latest_valid_exchange_rate()
+        if cached and str(cached.get("date", "")).strip() == str(rate_date or "").strip():
+            return dict(cached)
+
+        if self._data_handler is None:
+            return None
 
         try:
-            with open(self._exchange_rate_cache_path, encoding="utf-8") as f:
-                payload = json.load(f)
-            if not isinstance(payload, dict):
-                return
-            rate = float(payload.get("rate", 0) or 0)
-            if rate <= 0:
-                return
-            self._exchange_rate_cache = payload
-            if str(payload.get("date", "")).strip() == date.today().isoformat():
-                self._exchange_rate_query_day = date.today().isoformat()
+            row = self._data_handler.get_exchange_rate_on_date(
+                currency_pair="USD/CNY",
+                rate_date=rate_date,
+            )
         except Exception as e:
-            self._logger.warning(f"读取汇率缓存失败: {e}")
+            self._logger.warning(f"读取当日汇率失败: {e}")
+            return None
 
-    def _save_exchange_rate_cache(self) -> None:
-        if self._exchange_rate_cache_path is None:
-            return
-        if not self._exchange_rate_cache:
-            return
+        if not isinstance(row, dict):
+            return None
+        normalized = self._normalize_exchange_rate_record(row)
+        if not self._is_valid_exchange_rate_record(normalized):
+            return None
+        self._exchange_rate_cache = dict(normalized)
+        return dict(normalized)
+
+    def _get_latest_valid_exchange_rate(self) -> dict[str, Any] | None:
+        if self._is_valid_exchange_rate_record(self._exchange_rate_cache):
+            return dict(self._exchange_rate_cache)
+
+        if self._data_handler is None:
+            return None
 
         try:
-            with open(self._exchange_rate_cache_path, "w", encoding="utf-8") as f:
-                json.dump(self._exchange_rate_cache, f, ensure_ascii=False, indent=2)
+            row = self._data_handler.get_latest_exchange_rate(currency_pair="USD/CNY")
         except Exception as e:
-            self._logger.warning(f"写入汇率缓存失败: {e}")
+            self._logger.warning(f"读取最新汇率失败: {e}")
+            return None
+
+        if not isinstance(row, dict):
+            return None
+        normalized = self._normalize_exchange_rate_record(row)
+        if not self._is_valid_exchange_rate_record(normalized):
+            return None
+        self._exchange_rate_cache = dict(normalized)
+        return dict(normalized)

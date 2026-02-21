@@ -339,7 +339,7 @@ NAV_SYNC_INTRADAY_END = "14:55"
     "astrbot_plugin_fund_analyzer",
     "2529huang",
     "基金数据分析插件 - 使用AKShare获取LOF/ETF基金数据",
-    "1.5.0",
+    "1.5.1",
 )
 class FundAnalyzerPlugin(Star):
     """基金分析插件主类"""
@@ -421,7 +421,11 @@ class FundAnalyzerPlugin(Star):
             normalize_fund_code=self._normalize_ssgz_fund_code,
             logger=logger,
         )
-        self.market_service = MarketService(logger=logger, metal_cache_ttl=METAL_CACHE_TTL)
+        self.market_service = MarketService(
+            logger=logger,
+            metal_cache_ttl=METAL_CACHE_TTL,
+            data_handler=self.data_handler,
+        )
         self.analysis_service = AnalysisService(logger=logger)
         self.nav_sync_service = NavSyncService(
             data_handler=self.data_handler,
@@ -447,7 +451,6 @@ class FundAnalyzerPlugin(Star):
         # 获取插件数据目录
         self._data_dir = Path(StarTools.get_data_dir("fund_analyzer"))
         self._data_dir.mkdir(parents=True, exist_ok=True)
-        self.market_service.set_data_dir(self._data_dir)
         # 加载用户设置
         self.user_fund_settings: dict[str, str] = self._load_user_settings()
         # QDII 识别缓存（跨命令复用）
